@@ -11,7 +11,7 @@ Binary face-image classifier that labels a crop as **real (0)** or **deepfake (1
 | **Primary metric** | Validation ROC-AUC (see [`evaluation_metric.md`](evaluation_metric.md)) |
 | **Tracking** | MLflow, experiment `Deepfake Detection`, store `./mlruns/` |
 | **Submitted inference** | flip TTA **on** + **FP32** + deterministic CUDA settings — the defaults of `inference_script.py`; `--amp` / `--no_tta` are explicit opt-ins |
-| **Inference budget** | 3,000 test images in **73–80 s** (38–41 img/s, FP32 + flip TTA) on the RTX 3050 — far below the 5-minute T4 limit. AMP (`--amp`) remains available at ~38–56 s |
+| **Inference budget** | 3,000 test images in **73–84 s** (36–41 img/s, FP32 + flip TTA) on the RTX 3050 — far below the 5-minute T4 limit. AMP (`--amp`) remains available at ~38–56 s |
 
 ## 1. Problem and constraints
 
@@ -91,7 +91,7 @@ Held-out validation split: **1,400 images** (20 %, stratified, seed 42). All num
   (`model_state_sha256 = 240c8c8c…`, `model_state_modified = false` in `provenance`).
 * **Plots / diagnostics:** `reports/eval_soup/roc_curve.png`, `confusion_matrix.png`, `metrics.json`,
   `predictions.csv`; per-run curves in `reports/<run_name>/`.
-* **Test set (3,000 images, flip TTA + FP32):** **73–80 s** total → **38–41 images/s**, 51.6 %
+* **Test set (3,000 images, flip TTA + FP32):** **73–84 s** total → **36–41 images/s**, 51.6 %
   predicted fake, mean confidence 0.531, **2,997 unique confidence values**. Two runs of the exact
   submission command produced the same SHA-256 (`c46225fd…`); the FP32 and AMP CSVs agree on
   2,998/3,000 labels (Spearman 0.999994).
@@ -122,7 +122,7 @@ the evaluator runs a T4. Three repeat runs per precision on the same 1,400-image
   overwhelmingly within the same class.
 * FP32 is now the submitted recipe because it removes the cross-architecture fp16 difference
   (2/3,000 labels differed between the RTX 3050 AMP and FP32 CSVs; Spearman 0.999994) at **no
-  meaningful AUC cost**. FP32 runs 3,000 images in **73–80 s**, still far inside the 5-minute T4
+  meaningful AUC cost**. FP32 runs 3,000 images in **73–84 s**, still far inside the 5-minute T4
   budget. AMP remains available with `--amp` when speed is preferred.
 * The comparison is a **measured validation result**; no hidden-test score is claimed.
 
