@@ -1,9 +1,12 @@
 """Training entry point with MLflow experiment tracking.
 
-Example
--------
-python src/train.py --arch efficientnet_b0 --epochs 12 --batch_size 32 \
-    --lr 3e-4 --variant baseline --run_name efficientnet_b0_baseline
+Phase 1 example (ResNet-50 + EMA + robust augmentation + composite selection):
+
+python src/train.py --arch resnet50 --backend torchvision --epochs 15 \
+    --batch_size 64 --lr 2e-4 --weight_decay 1e-2 --dropout 0.4 \
+    --label_smoothing 0.05 --ema --robust_aug --degradation_p 0.4 \
+    --robust_start_epoch 3 --selection_metric composite \
+    --variant phase1_ema_robust --run_name resnet50_phase1
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 # MLflow >= 3.16 blocks the filesystem store by default; the hackathon blueprint
 # requires ./mlruns/, so opt out of the maintenance guard explicitly. Both flags
@@ -24,6 +27,7 @@ os.environ.setdefault("MLFLOW_DISABLE_AGENT_HINT", "1")
 import mlflow  # noqa: E402  (import order is intentional: env vars must come first)
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+from sklearn.model_selection import train_test_split  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 from torch.optim import AdamW  # noqa: E402
@@ -41,16 +45,21 @@ if str(SRC_DIR) not in sys.path:
 
 from dataset import (  # noqa: E402
     build_eval_transform,
+    build_robust_train_transform,
     build_train_dataframe,
     build_train_transform,
     class_balance,
     create_dataloaders,
+    create_dual_view_loader,
     train_val_split,
 )
 from model import build_model, build_optimizer_param_groups, resolve_backend  # noqa: E402
+from robustness import evaluate_variant  # noqa: E402
 from utils import (  # noqa: E402
     AverageMeter,
+    ModelEMA,
     Timer,
+    composite_auc,
     compute_metrics,
     environment_info,
     get_device,
@@ -61,6 +70,7 @@ from utils import (  # noqa: E402
     save_checkpoint,
     save_yaml,
     seed_everything,
+    update_bn_stats,
 )
 
 
@@ -117,6 +127,49 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--plots_dir", type=str, default="reports")
     parser.add_argument("--val_tta", action="store_true", default=False)
+    # Phase 1: robust augmentation, EMA, composite selection
+    parser.add_argument(
+        "--robust_aug",
+        action="store_true",
+        default=False,
+        help="add one of JPEG/blur/noise/downscale/brightness degradations per image",
+    )
+    parser.add_argument("--degradation_p", type=float, default=0.4)
+    parser.add_argument(
+        "--robust_start_epoch",
+        type=int,
+        default=3,
+        help="epoch at which the robust transform replaces the mild transform (1 = from start)",
+    )
+    parser.add_argument("--ema", action="store_true", default=False)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--ema_bn_batches", type=int, default=100)
+    parser.add_argument(
+        "--consistency_weight",
+        type=float,
+        default=0.0,
+        help="weight of the clean/degraded consistency MSE (0 = disabled)",
+    )
+    parser.add_argument(
+        "--selection_metric",
+        type=str,
+        default="composite",
+        choices=["clean_auc", "composite"],
+        help="checkpoint/early-stopping criterion",
+    )
+    parser.add_argument("--selection_clean_weight", type=float, default=0.5)
+    parser.add_argument(
+        "--robust_eval_every",
+        type=int,
+        default=1,
+        help="compute the degraded monitor every N epochs (reuses the last value otherwise)",
+    )
+    parser.add_argument("--robust_monitor_samples", type=int, default=200)
+    parser.add_argument(
+        "--robust_monitor_variants",
+        type=str,
+        default="jpeg_q50,blur_s1.0,noise_0.03",
+    )
     return parser.parse_args(argv)
 
 
@@ -132,6 +185,8 @@ def train_one_epoch(
     grad_clip: float = 0.0,
     epoch: int = 0,
     epochs: int = 0,
+    ema: Optional[Any] = None,
+    consistency_weight: float = 0.0,
 ) -> float:
     """One supervised pass over the training loader; returns mean loss."""
     model.train()
@@ -148,6 +203,14 @@ def train_one_epoch(
         with torch.amp.autocast("cuda", enabled=use_amp):
             logits = model(images)
             loss = criterion(logits, targets)
+            if consistency_weight > 0 and "image_degraded" in batch:
+                degraded = batch["image_degraded"].to(device, non_blocking=True)
+                logits_degraded = model(degraded)
+                loss = loss + criterion(logits_degraded, targets)
+                consistency = torch.mean(
+                    (torch.sigmoid(logits) - torch.sigmoid(logits_degraded)) ** 2
+                )
+                loss = loss + consistency_weight * consistency
 
         scaler.scale(loss).backward()
         if grad_clip and grad_clip > 0:
@@ -155,6 +218,9 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(optimizer)
         scaler.update()
+
+        if ema is not None:
+            ema.update(model)
 
         meter.update(loss.item(), images.size(0))
         progress.set_postfix(loss=f"{meter.avg:.4f}")
@@ -170,9 +236,12 @@ def validate(
     tta: bool = False,
     epoch: int = 0,
     epochs: int = 0,
+    amp: Optional[bool] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """Evaluate the model and return (val loss, prediction dict with metrics)."""
-    outputs = predict_loader(model, loader, device, tta=tta, desc=f"val {epoch}/{epochs}")
+    outputs = predict_loader(model, loader, device, tta=tta, amp=amp, desc=f"val {epoch}/{epochs}")
+    if outputs["probs"].size and not np.isfinite(outputs["probs"]).all():
+        raise ValueError("non-finite probabilities in validation outputs")
     targets = outputs["labels"].astype(np.float32)
     with torch.no_grad():
         logits = torch.from_numpy(outputs["logits"]).float().unsqueeze(1)
@@ -189,8 +258,62 @@ def resolve_tracking_uri(tracking_uri: str) -> str:
     return Path(tracking_uri).resolve().as_uri()
 
 
+def _stratified_sample(df: pd.DataFrame, n: int, seed: int = 42) -> pd.DataFrame:
+    """Small label-balanced subset used by the per-epoch robustness monitor."""
+    if n <= 0 or n >= len(df):
+        return df.reset_index(drop=True)
+    sampled, _ = train_test_split(
+        df,
+        train_size=int(n),
+        stratify=df["label"].to_numpy(),
+        random_state=seed,
+    )
+    return sampled.reset_index(drop=True)
+
+
+def _monitor_degraded_aucs(
+    model: torch.nn.Module,
+    monitor_df: pd.DataFrame,
+    variants: list[str],
+    device: torch.device,
+    img_size: int,
+    eval_resize: Optional[int],
+    batch_size: int,
+    num_workers: int,
+    use_amp: bool,
+) -> list[float]:
+    """AUC on a few degradations for the composite checkpoint criterion."""
+    aucs: list[float] = []
+    for variant in variants:
+        try:
+            metrics = evaluate_variant(
+                model=model,
+                dataframe=monitor_df,
+                name=variant,
+                device=device,
+                img_size=img_size,
+                eval_resize=eval_resize,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                tta=False,
+                amp=use_amp,
+                verbose=False,
+            )
+        except ValueError as exc:
+            print(f"[train] robustness monitor {variant!r} failed: {exc}", flush=True)
+            continue
+        aucs.append(float(metrics["auc"]))
+    return aucs
+
+
 def main(argv: Any = None) -> Dict[str, Any]:
     args = parse_args(argv)
+    if args.consistency_weight > 0 and not args.robust_aug:
+        print(
+            "[train] --consistency_weight requires --robust_aug; disabling the consistency loss",
+            flush=True,
+        )
+        args.consistency_weight = 0.0
     seed_everything(args.seed)
     device = get_device()
     use_amp = bool(args.amp and device.type == "cuda")
@@ -209,21 +332,78 @@ def main(argv: Any = None) -> Dict[str, Any]:
     if args.limit_val:
         val_df = val_df.groupby("label", group_keys=False).head(max(1, args.limit_val // 2))
 
-    train_transform = (
-        build_eval_transform(args.img_size, args.eval_resize or None)
-        if args.no_aug
-        else build_train_transform(args.img_size)
+    eval_transform = build_eval_transform(args.img_size, args.eval_resize or None)
+    mild_transform = eval_transform if args.no_aug else build_train_transform(args.img_size)
+    robust_transform = (
+        build_robust_train_transform(
+            img_size=args.img_size,
+            degradation_p=args.degradation_p,
+        )
+        if args.robust_aug
+        else mild_transform
     )
-    train_loader, val_loader = create_dataloaders(
-        train_df,
+
+    use_dual_view = bool(args.robust_aug and args.consistency_weight > 0)
+    if use_dual_view:
+        train_loader = create_dual_view_loader(
+            train_df,
+            clean_transform=mild_transform,
+            degraded_transform=robust_transform,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+    else:
+        initial_transform = (
+            robust_transform
+            if args.robust_aug and args.robust_start_epoch <= 1
+            else mild_transform
+        )
+        train_loader, _ = create_dataloaders(
+            train_df,
+            None,
+            img_size=args.img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            train_transform=initial_transform,
+        )
+    _, val_loader = create_dataloaders(
+        None,
         val_df,
         img_size=args.img_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         eval_resize=args.eval_resize or None,
-        train_transform=train_transform,
+        eval_transform=eval_transform,
     )
     assert train_loader is not None and val_loader is not None
+
+    bn_loader = None
+    if args.ema:
+        bn_loader, _ = create_dataloaders(
+            train_df,
+            None,
+            img_size=args.img_size,
+            batch_size=min(32, args.batch_size),
+            num_workers=args.num_workers,
+            train_transform=eval_transform,
+            drop_last=False,
+        )
+        assert bn_loader is not None
+
+    monitor_df = None
+    monitor_variants: list[str] = []
+    if args.selection_metric == "composite" and args.robust_eval_every > 0:
+        monitor_df = _stratified_sample(val_df, args.robust_monitor_samples, seed=args.seed)
+        monitor_variants = [
+            variant.strip()
+            for variant in args.robust_monitor_variants.split(",")
+            if variant.strip()
+        ]
+        if monitor_variants:
+            print(
+                f"[train] robust monitor: {len(monitor_df)} images, variants={monitor_variants}",
+                flush=True,
+            )
 
     # ----------------------------------------------------------------- model
     resolved_backend = resolve_backend(args.arch, args.backend)
@@ -235,6 +415,7 @@ def main(argv: Any = None) -> Dict[str, Any]:
         drop_path_rate=args.drop_path,
         backend=resolved_backend,
     ).to(device)
+    ema = ModelEMA(model, decay=args.ema_decay, device=device) if args.ema else None
 
     criterion = nn.BCEWithLogitsLoss()
     decay_params, no_decay_params = build_optimizer_param_groups(model, args.weight_decay)
@@ -273,7 +454,9 @@ def main(argv: Any = None) -> Dict[str, Any]:
     config: Dict[str, Any] = {
         **vars(args),
         "backend": resolved_backend,
-        "augmentation": "none" if args.no_aug else "mild",
+        "augmentation": (
+            "none" if args.no_aug else ("robust" if args.robust_aug else "mild")
+        ),
         "run_name": run_name,
         "train_samples": int(len(train_df)),
         "val_samples": int(len(val_df)),
@@ -289,15 +472,23 @@ def main(argv: Any = None) -> Dict[str, Any]:
     mlflow.set_experiment(args.experiment)
 
     best_auc = -1.0
+    best_score = -1.0
+    best_composite = -1.0
+    best_candidate = "raw"
     best_epoch = -1
     best_metrics: Dict[str, float] = {}
     best_outputs: Dict[str, Any] = {}
     epochs_without_improvement = 0
+    last_degraded_aucs: list[float] = []
     history: Dict[str, list] = {
         "train_loss": [],
         "val_loss": [],
         "val_auc": [],
+        "val_auc_raw": [],
+        "val_auc_ema": [],
         "val_accuracy": [],
+        "selection_score": [],
+        "monitor_degraded_auc": [],
         "lr": [],
     }
 
@@ -316,6 +507,27 @@ def main(argv: Any = None) -> Dict[str, Any]:
 
         timer = Timer()
         for epoch in range(1, args.epochs + 1):
+            # Curriculum: switch from mild to robust augmentation once.
+            if (
+                args.robust_aug
+                and not use_dual_view
+                and args.robust_start_epoch > 1
+                and epoch == args.robust_start_epoch
+            ):
+                print(
+                    f"[train] switching to robust augmentation at epoch {epoch}",
+                    flush=True,
+                )
+                train_loader, _ = create_dataloaders(
+                    train_df,
+                    None,
+                    img_size=args.img_size,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    train_transform=robust_transform,
+                )
+                assert train_loader is not None
+
             train_loss = train_one_epoch(
                 model,
                 train_loader,
@@ -328,8 +540,11 @@ def main(argv: Any = None) -> Dict[str, Any]:
                 grad_clip=args.grad_clip,
                 epoch=epoch,
                 epochs=args.epochs,
+                ema=ema,
+                consistency_weight=args.consistency_weight,
             )
-            val_loss, val_payload = validate(
+
+            val_loss_raw, raw_payload = validate(
                 model,
                 val_loader,
                 criterion,
@@ -337,33 +552,112 @@ def main(argv: Any = None) -> Dict[str, Any]:
                 tta=args.val_tta,
                 epoch=epoch,
                 epochs=args.epochs,
+                amp=use_amp,
             )
+            raw_auc = float(raw_payload["metrics"]["auc"])
+
+            ema_valid = False
+            val_loss_ema = float("nan")
+            if ema is not None and bn_loader is not None:
+                update_bn_stats(ema.module, bn_loader, device, max_batches=args.ema_bn_batches)
+                try:
+                    # FP32 matches the submitted inference recipe and avoids fp16
+                    # overflow from BatchNorm statistics that were just recalibrated
+                    # on a small clean subset.
+                    val_loss_ema, ema_payload = validate(
+                        ema.module,
+                        val_loader,
+                        criterion,
+                        device,
+                        tta=args.val_tta,
+                        epoch=epoch,
+                        epochs=args.epochs,
+                        amp=False,
+                    )
+                    ema_valid = True
+                except ValueError as exc:
+                    print(
+                        f"[train] EMA validation failed ({exc}); "
+                        "using the raw model for this epoch",
+                        flush=True,
+                    )
+            if ema_valid:
+                candidate = ema.module
+                candidate_name = "ema"
+                val_loss, val_payload = val_loss_ema, ema_payload
+            else:
+                candidate = model
+                candidate_name = "raw"
+                val_loss, val_payload = val_loss_raw, raw_payload
+
             metrics = val_payload["metrics"]
+            ema_auc = float(metrics["auc"]) if candidate_name == "ema" else None
             current_lr = float(optimizer.param_groups[0]["lr"])
+
+            if (
+                monitor_df is not None
+                and monitor_variants
+                and epoch % max(args.robust_eval_every, 1) == 0
+            ):
+                last_degraded_aucs = _monitor_degraded_aucs(
+                    candidate,
+                    monitor_df,
+                    monitor_variants,
+                    device,
+                    args.img_size,
+                    args.eval_resize or None,
+                    min(64, args.batch_size),
+                    0,
+                    False,  # FP32 matches the submitted inference recipe
+                )
+
+            if args.selection_metric == "composite" and last_degraded_aucs:
+                selection_score = composite_auc(
+                    metrics["auc"],
+                    last_degraded_aucs,
+                    clean_weight=args.selection_clean_weight,
+                )
+            else:
+                selection_score = float(metrics["auc"])
+            monitor_auc = (
+                float(np.mean(last_degraded_aucs)) if last_degraded_aucs else float("nan")
+            )
 
             history["train_loss"].append(train_loss)
             history["val_loss"].append(val_loss)
             history["val_auc"].append(metrics["auc"])
+            history["val_auc_raw"].append(raw_auc)
+            history["val_auc_ema"].append(ema_auc if ema_auc is not None else float("nan"))
             history["val_accuracy"].append(metrics["accuracy"])
+            history["selection_score"].append(selection_score)
+            history["monitor_degraded_auc"].append(monitor_auc)
             history["lr"].append(current_lr)
 
-            mlflow.log_metrics(
-                {
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "val_auc": metrics["auc"],
-                    "val_accuracy": metrics["accuracy"],
-                    "val_precision": metrics["precision"],
-                    "val_recall": metrics["recall"],
-                    "val_f1": metrics["f1"],
-                    "lr": current_lr,
-                },
-                step=epoch,
-            )
+            log_payload = {
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_auc": metrics["auc"],
+                "val_auc_raw": raw_auc,
+                "val_accuracy": metrics["accuracy"],
+                "val_precision": metrics["precision"],
+                "val_recall": metrics["recall"],
+                "val_f1": metrics["f1"],
+                "selection_score": selection_score,
+                "lr": current_lr,
+            }
+            if ema_auc is not None:
+                log_payload["val_auc_ema"] = ema_auc
+            if last_degraded_aucs:
+                log_payload["monitor_degraded_auc"] = monitor_auc
+            mlflow.log_metrics(log_payload, step=epoch)
+
             print(
                 f"[{run_name}] epoch {epoch}/{args.epochs} "
                 f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-                f"val_auc={metrics['auc']:.4f} val_acc={metrics['accuracy']:.4f} lr={current_lr:.2e}",
+                f"val_auc={metrics['auc']:.4f} raw_auc={raw_auc:.4f} "
+                f"ema_auc={ema_auc if ema_auc is not None else float('nan'):.4f} "
+                f"monitor_auc={monitor_auc:.4f} selection={selection_score:.4f} "
+                f"lr={current_lr:.2e}",
                 flush=True,
             )
 
@@ -373,20 +667,42 @@ def main(argv: Any = None) -> Dict[str, Any]:
                 else:
                     scheduler.step()
 
-            epoch_metrics = {**metrics, "val_loss": val_loss, "train_loss": train_loss}
-            if metrics["auc"] > best_auc:
-                best_auc = metrics["auc"]
+            epoch_metrics = {
+                **metrics,
+                "val_loss": val_loss,
+                "train_loss": train_loss,
+                "val_auc_raw": raw_auc,
+                "selection_score": selection_score,
+                "monitor_degraded_auc": monitor_auc,
+            }
+            if selection_score > best_score:
+                best_score = selection_score
+                best_auc = float(metrics["auc"])
+                best_composite = (
+                    selection_score if args.selection_metric == "composite" else -1.0
+                )
+                best_candidate = candidate_name
                 best_epoch = epoch
-                best_metrics = dict(metrics)
+                best_metrics = {**metrics, "selection_score": selection_score}
+                if last_degraded_aucs:
+                    best_metrics["monitor_degraded_auc"] = monitor_auc
                 best_outputs = val_payload["outputs"]
                 epochs_without_improvement = 0
                 save_checkpoint(
                     run_dir / "best.pth",
-                    model,
+                    candidate,
                     arch=args.arch,
                     config=config,
                     epoch=epoch,
                     metrics=epoch_metrics,
+                    extra={
+                        "checkpoint_type": candidate_name,
+                        "selection_metric": args.selection_metric,
+                        "selection_score": selection_score,
+                        "clean_auc": float(metrics["auc"]),
+                        "degraded_aucs": last_degraded_aucs,
+                        "monitor_variants": monitor_variants,
+                    },
                 )
             else:
                 epochs_without_improvement += 1
@@ -401,13 +717,18 @@ def main(argv: Any = None) -> Dict[str, Any]:
                 optimizer=optimizer,
                 scheduler=scheduler,
                 include_optimizer=True,
+                extra={"checkpoint_type": "raw"},
             )
 
             if (
                 args.early_stopping_patience > 0
                 and epochs_without_improvement >= args.early_stopping_patience
             ):
-                print(f"Early stopping at epoch {epoch} (no AUC improvement).", flush=True)
+                print(
+                    f"Early stopping at epoch {epoch} "
+                    f"(no {args.selection_metric} improvement).",
+                    flush=True,
+                )
                 break
 
         train_seconds = timer.elapsed
@@ -437,18 +758,20 @@ def main(argv: Any = None) -> Dict[str, Any]:
             }
         ).to_csv(predictions_path, index=False)
 
-        mlflow.log_metrics(
-            {
-                "best_val_auc": float(best_auc),
-                "best_epoch": int(best_epoch),
-                "train_seconds": float(train_seconds),
-                "seconds_per_epoch": float(train_seconds / max(len(history["train_loss"]), 1)),
-                **{f"best_{k}": float(v) for k, v in best_metrics.items()},
-            }
-        )
+        final_metrics = {
+            "best_val_auc": float(best_auc),
+            "best_epoch": int(best_epoch),
+            "train_seconds": float(train_seconds),
+            "seconds_per_epoch": float(train_seconds / max(len(history["train_loss"]), 1)),
+            **{f"best_{k}": float(v) for k, v in best_metrics.items()},
+        }
+        if best_composite >= 0:
+            final_metrics["best_composite_auc"] = float(best_composite)
+        mlflow.log_metrics(final_metrics)
         for artifact in (curves_path, roc_path, cm_path, predictions_path, run_dir / "best.pth"):
             mlflow.log_artifact(str(artifact))
         mlflow.set_tag("best_epoch", str(best_epoch))
+        mlflow.set_tag("best_candidate", best_candidate)
 
     results = {
         "run_name": run_name,
@@ -456,12 +779,19 @@ def main(argv: Any = None) -> Dict[str, Any]:
         "arch": args.arch,
         "best_epoch": best_epoch,
         "best_val_auc": best_auc,
+        "best_selection_score": best_score,
+        "best_composite_auc": best_composite if best_composite >= 0 else None,
+        "best_candidate": best_candidate,
         "best_metrics": best_metrics,
         "checkpoint": str(run_dir / "best.pth"),
         "train_seconds": train_seconds,
         "history": history,
     }
-    print(f"Best val AUC: {best_auc:.4f} at epoch {best_epoch} -> {results['checkpoint']}", flush=True)
+    print(
+        f"Best {args.selection_metric}: {best_score:.4f} at epoch {best_epoch} "
+        f"(clean AUC {best_auc:.4f}, candidate {best_candidate}) -> {results['checkpoint']}",
+        flush=True,
+    )
     return results
 
 

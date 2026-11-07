@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import io
+import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold, train_test_split
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -209,6 +212,44 @@ class DeepfakeDataset(Dataset):
         }
 
 
+class DualViewDataset(Dataset):
+    """Return a clean view and a degraded view of the same training image.
+
+    Used only when the optional clean/degraded consistency loss is enabled; the
+    standard training path uses :class:`DeepfakeDataset`.
+    """
+
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        clean_transform: Any,
+        degraded_transform: Any,
+    ) -> None:
+        required = {"image_id", "path"}
+        missing = required - set(dataframe.columns)
+        if missing:
+            raise ValueError(f"Dataframe is missing columns: {sorted(missing)}")
+        self.dataframe = dataframe.reset_index(drop=True)
+        self.clean_transform = clean_transform
+        self.degraded_transform = degraded_transform
+        self.has_labels = "label" in self.dataframe.columns
+
+    def __len__(self) -> int:
+        return len(self.dataframe)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        row = self.dataframe.iloc[index]
+        image = load_image(row["path"])
+        label = int(row["label"]) if self.has_labels else -1
+        return {
+            "image": self.clean_transform(image),
+            "image_degraded": self.degraded_transform(image),
+            "label": label,
+            "image_id": str(row["image_id"]),
+            "load_ok": True,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Transforms
 # ---------------------------------------------------------------------------
@@ -218,6 +259,7 @@ def build_train_transform(
     rotation_degrees: float = 10.0,
     jitter: float = 0.2,
     hflip: float = 0.5,
+    rotation_fill: Tuple[int, int, int] = (124, 116, 104),
 ) -> transforms.Compose:
     """Mild augmentation that preserves forensic / frequency artefacts."""
     return transforms.Compose(
@@ -229,7 +271,9 @@ def build_train_transform(
                 antialias=True,
             ),
             transforms.RandomHorizontalFlip(p=hflip),
-            transforms.RandomApply([transforms.RandomRotation(rotation_degrees)], p=0.5),
+            transforms.RandomApply(
+                [transforms.RandomRotation(rotation_degrees, fill=rotation_fill)], p=0.5
+            ),
             transforms.RandomApply(
                 [
                     transforms.ColorJitter(
@@ -238,6 +282,129 @@ def build_train_transform(
                 ],
                 p=0.5,
             ),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+
+
+class RandomJPEG:
+    """Re-encode a PIL image as JPEG at a random quality."""
+
+    def __init__(self, quality_range: Tuple[int, int] = (30, 90)) -> None:
+        self.quality_range = (int(quality_range[0]), int(quality_range[1]))
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        quality = random.randint(*self.quality_range)
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, format="JPEG", quality=quality, subsampling=2)
+        buffer.seek(0)
+        return Image.open(buffer).convert("RGB")
+
+
+class RandomGaussianBlur:
+    def __init__(self, sigma_range: Tuple[float, float] = (0.1, 1.5)) -> None:
+        self.sigma_range = (float(sigma_range[0]), float(sigma_range[1]))
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        sigma = random.uniform(*self.sigma_range)
+        return image.convert("RGB").filter(ImageFilter.GaussianBlur(radius=sigma))
+
+
+class RandomGaussianNoise:
+    def __init__(self, std_range: Tuple[float, float] = (0.005, 0.03)) -> None:
+        self.std_range = (float(std_range[0]), float(std_range[1]))
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        std = random.uniform(*self.std_range)
+        array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+        noise = np.random.normal(0.0, std, size=array.shape).astype(np.float32)
+        array = np.clip(array + noise, 0.0, 1.0)
+        return Image.fromarray((array * 255.0 + 0.5).astype(np.uint8), mode="RGB")
+
+
+class RandomDownscale:
+    def __init__(self, scale_range: Tuple[float, float] = (0.5, 0.9)) -> None:
+        self.scale_range = (float(scale_range[0]), float(scale_range[1]))
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        scale = random.uniform(*self.scale_range)
+        image = image.convert("RGB")
+        width, height = image.size
+        small = image.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))), Image.LANCZOS
+        )
+        return small.resize((width, height), Image.BICUBIC)
+
+
+class RandomBrightnessContrast:
+    def __init__(self, limit: float = 0.2) -> None:
+        self.limit = float(limit)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        image = image.convert("RGB")
+        brightness = 1.0 + random.uniform(-self.limit, self.limit)
+        contrast = 1.0 + random.uniform(-self.limit, self.limit)
+        image = ImageEnhance.Brightness(image).enhance(brightness)
+        return ImageEnhance.Contrast(image).enhance(contrast)
+
+
+def build_robust_train_transform(
+    img_size: int = 224,
+    crop_scale: Sequence[float] = (0.80, 1.0),
+    rotation_degrees: float = 10.0,
+    jitter: float = 0.2,
+    hflip: float = 0.5,
+    rotation_fill: Tuple[int, int, int] = (124, 116, 104),
+    degradation_p: float = 0.4,
+    jpeg_quality_range: Tuple[int, int] = (30, 90),
+    blur_sigma_range: Tuple[float, float] = (0.1, 1.5),
+    noise_std_range: Tuple[float, float] = (0.005, 0.03),
+    downscale_range: Tuple[float, float] = (0.5, 0.9),
+    brightness_contrast_limit: float = 0.2,
+) -> transforms.Compose:
+    """Mild augmentation plus one optional degradation per image.
+
+    With probability ``degradation_p`` exactly one of JPEG / blur / noise /
+    downscale / brightness-contrast is applied; otherwise the image stays
+    clean. This keeps the clean signal dominant while teaching the model the
+    degradation modes used by the hidden robustness variants.
+    """
+    degradation = transforms.RandomApply(
+        [
+            transforms.RandomChoice(
+                [
+                    RandomJPEG(jpeg_quality_range),
+                    RandomGaussianBlur(blur_sigma_range),
+                    RandomGaussianNoise(noise_std_range),
+                    RandomDownscale(downscale_range),
+                    RandomBrightnessContrast(brightness_contrast_limit),
+                ]
+            )
+        ],
+        p=float(degradation_p),
+    )
+    return transforms.Compose(
+        [
+            transforms.RandomResizedCrop(
+                img_size,
+                scale=tuple(crop_scale),
+                ratio=(0.9, 1.111),
+                antialias=True,
+            ),
+            transforms.RandomHorizontalFlip(p=hflip),
+            transforms.RandomApply(
+                [transforms.RandomRotation(rotation_degrees, fill=rotation_fill)], p=0.5
+            ),
+            transforms.RandomApply(
+                [
+                    transforms.ColorJitter(
+                        brightness=jitter, contrast=jitter, saturation=jitter * 0.5, hue=0.02
+                    )
+                ],
+                p=0.5,
+            ),
+            degradation,
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
@@ -305,6 +472,28 @@ def create_dataloaders(
     return train_loader, val_loader
 
 
+def create_dual_view_loader(
+    train_df: pd.DataFrame,
+    clean_transform: Any,
+    degraded_transform: Any,
+    batch_size: int = 32,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    drop_last: bool = True,
+) -> DataLoader:
+    """Training loader returning both a clean and a degraded view per image."""
+    return DataLoader(
+        DualViewDataset(train_df, clean_transform, degraded_transform),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=drop_last,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+
+
 def create_test_loader(
     test_df: pd.DataFrame,
     img_size: int = 224,
@@ -344,12 +533,15 @@ def class_balance(df: pd.DataFrame) -> Dict[str, float]:
 
 __all__ = [
     "DeepfakeDataset",
+    "DualViewDataset",
     "build_train_dataframe",
     "build_test_dataframe",
     "train_val_split",
     "build_train_transform",
+    "build_robust_train_transform",
     "build_eval_transform",
     "create_dataloaders",
+    "create_dual_view_loader",
     "create_test_loader",
     "class_balance",
     "load_image",

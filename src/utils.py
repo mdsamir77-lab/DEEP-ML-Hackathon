@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import random
@@ -161,6 +163,131 @@ class Timer:
 
     def reset(self) -> None:
         self.start = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Model averaging / BatchNorm recalibration
+# ---------------------------------------------------------------------------
+class ModelEMA:
+    """Exponential moving average of model parameters and buffers.
+
+    The decay follows the standard warm-up ``min(decay, (1+n)/(10+n))`` so the
+    average is not dominated by the random initial weights in short runs.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        decay: float = 0.999,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        self.module = copy.deepcopy(model).eval()
+        for parameter in self.module.parameters():
+            parameter.requires_grad_(False)
+        self.decay = float(decay)
+        self.device = device
+        self.updates = 0
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        self.updates += 1
+        decay = min(self.decay, (1.0 + self.updates) / (10.0 + self.updates))
+        model_state = model.state_dict()
+        for key, value in self.module.state_dict().items():
+            source = model_state[key].detach()
+            if value.dtype.is_floating_point:
+                value.copy_(decay * value + (1.0 - decay) * source)
+            else:
+                value.copy_(source)
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return self.module.state_dict()
+
+
+@torch.no_grad()
+def update_bn_stats(
+    model: torch.nn.Module,
+    loader: Iterable,
+    device: torch.device,
+    max_batches: int = 100,
+) -> int:
+    """Recompute BatchNorm running statistics on a clean loader.
+
+    Returns the number of batches used. Models without BatchNorm are left
+    unchanged. Dropout stays disabled because only BN modules are set to train
+    mode.
+    """
+    model.eval()
+    bn_modules = []
+    original_momenta = []
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            original_momenta.append((module, module.momentum))
+            module.train()
+            module.reset_running_stats()
+            module.momentum = None
+            bn_modules.append(module)
+    if not bn_modules:
+        return 0
+    batches = 0
+    try:
+        for batch in loader:
+            images = batch["image"].to(device, non_blocking=True)
+            model(images)
+            batches += 1
+            if max_batches and batches >= max_batches:
+                break
+    finally:
+        for module, momentum in original_momenta:
+            module.momentum = momentum
+        model.eval()
+    return batches
+
+
+def state_dict_sha256(state_dict: Dict[str, torch.Tensor]) -> str:
+    """Deterministic SHA-256 over sorted tensor names, dtypes, shapes and bytes."""
+    digest = hashlib.sha256()
+    for key in sorted(state_dict):
+        tensor = state_dict[key].detach().cpu().contiguous()
+        digest.update(key.encode())
+        digest.update(str(tensor.dtype).encode())
+        digest.update(str(tuple(tensor.shape)).encode())
+        digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def average_state_dicts(
+    state_dicts: Sequence[Dict[str, torch.Tensor]],
+    weights: Optional[Sequence[float]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Weighted element-wise average of compatible state dicts (model soup)."""
+    if not state_dicts:
+        raise ValueError("state_dicts must not be empty")
+    reference = state_dicts[0]
+    reference_keys = set(reference)
+    for state_dict in state_dicts[1:]:
+        if set(state_dict) != reference_keys:
+            raise ValueError("state dicts have different key sets")
+    if weights is None:
+        weights = [1.0 / len(state_dicts)] * len(state_dicts)
+    if len(weights) != len(state_dicts):
+        raise ValueError("weights must match the number of state dicts")
+    total = float(sum(weights))
+    if total <= 0:
+        raise ValueError("weights must sum to a positive value")
+    normalized = [float(weight) / total for weight in weights]
+
+    averaged: Dict[str, torch.Tensor] = {}
+    for key in reference:
+        tensors = [state_dict[key] for state_dict in state_dicts]
+        if any(tensor.shape != tensors[0].shape for tensor in tensors):
+            raise ValueError(f"shape mismatch for {key}")
+        if tensors[0].dtype.is_floating_point:
+            value = sum(weight * tensor.float() for weight, tensor in zip(normalized, tensors))
+            averaged[key] = value.to(tensors[0].dtype)
+        else:
+            averaged[key] = tensors[0].clone()
+    return averaged
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +525,7 @@ def save_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
     scheduler: Optional[Any] = None,
     include_optimizer: bool = False,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -412,6 +540,8 @@ def save_checkpoint(
         state["optimizer_state"] = optimizer.state_dict()
     if include_optimizer and scheduler is not None:
         state["scheduler_state"] = scheduler.state_dict()
+    if extra:
+        state.update(extra)
     torch.save(state, path)
     return path
 

@@ -82,10 +82,12 @@ export MLFLOW_DISABLE_AGENT_HINT=1
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-## 4. Phase 1 training command (preview)
+## 4. Phase 1 training commands (exact)
 
-The exact Phase 1 code (EMA, robust augmentation, composite model selection) will be
-delivered after Phase 0 approval. The command shape will be:
+All commands use the Phase 1 code delivered in this phase. Use a **single T4** and
+`CUDA_VISIBLE_DEVICES=0`. `--num_workers 4` is a good default on Kaggle.
+
+### P1-A — EMA + mild augmentation (clean-AUC control)
 
 ```bash
 python src/train.py \
@@ -94,15 +96,96 @@ python src/train.py \
   --epochs 15 --batch_size 64 --lr 2e-4 --weight_decay 1e-2 \
   --dropout 0.4 --label_smoothing 0.05 \
   --img_size 224 --eval_resize 224 --num_workers 4 \
-  --scheduler cosine --warmup_epochs 1 --early_stopping_patience 4 \
+  --scheduler cosine --warmup_epochs 1 --early_stopping_patience 5 \
+  --ema --ema_decay 0.999 --ema_bn_batches 100 \
+  --selection_metric clean_auc \
   --checkpoint_dir /kaggle/working/deepfake/checkpoints \
   --plots_dir /kaggle/working/deepfake/reports \
   --tracking_uri /kaggle/working/deepfake/mlruns \
-  --variant phase1_ema_robust --run_name resnet50_phase1_<date>
+  --variant phase1_ema --run_name p1a_ema_<date>
 ```
 
-Expected runtime: ~15–25 min per run on a T4 (ResNet-50, 15 epochs, 5,600 images).
-Phase 1 budget: 3–5 runs, ~2–3 GPU hours (leave margin for Kaggle restarts).
+### P1-B — EMA + robust augmentation + composite selection (main candidate)
+
+```bash
+python src/train.py \
+  --data_dir /kaggle/input/deepfake-hackathon/hackathon_dataset \
+  --arch resnet50 --backend torchvision \
+  --epochs 15 --batch_size 64 --lr 2e-4 --weight_decay 1e-2 \
+  --dropout 0.4 --label_smoothing 0.05 \
+  --img_size 224 --eval_resize 224 --num_workers 4 \
+  --scheduler cosine --warmup_epochs 1 --early_stopping_patience 5 \
+  --ema --ema_decay 0.999 --ema_bn_batches 100 \
+  --robust_aug --degradation_p 0.4 --robust_start_epoch 3 \
+  --selection_metric composite --selection_clean_weight 0.5 \
+  --robust_eval_every 1 --robust_monitor_samples 200 \
+  --robust_monitor_variants jpeg_q50,blur_s1.0,noise_0.03 \
+  --checkpoint_dir /kaggle/working/deepfake/checkpoints \
+  --plots_dir /kaggle/working/deepfake/reports \
+  --tracking_uri /kaggle/working/deepfake/mlruns \
+  --variant phase1_ema_robust --run_name p1b_ema_robust_<date>
+```
+
+### P1-C — optional consistency loss (only if P1-B’s worst variant is below ~0.87)
+
+```bash
+python src/train.py \
+  --data_dir /kaggle/input/deepfake-hackathon/hackathon_dataset \
+  --arch resnet50 --backend torchvision \
+  --epochs 15 --batch_size 64 --lr 2e-4 --weight_decay 1e-2 \
+  --dropout 0.4 --label_smoothing 0.05 \
+  --img_size 224 --eval_resize 224 --num_workers 4 \
+  --scheduler cosine --warmup_epochs 1 --early_stopping_patience 5 \
+  --ema --ema_decay 0.999 --ema_bn_batches 100 \
+  --robust_aug --degradation_p 0.4 --consistency_weight 0.05 \
+  --selection_metric composite \
+  --robust_eval_every 1 --robust_monitor_samples 200 \
+  --robust_monitor_variants jpeg_q50,blur_s1.0,noise_0.03 \
+  --checkpoint_dir /kaggle/working/deepfake/checkpoints \
+  --plots_dir /kaggle/working/deepfake/reports \
+  --tracking_uri /kaggle/working/deepfake/mlruns \
+  --variant phase1_consistency --run_name p1c_consistency_<date>
+```
+
+### P1-D — soup the best runs
+
+```bash
+python src/soup.py \
+  --checkpoints \
+    checkpoints/runs/p1b_ema_robust_<date>/best.pth \
+    checkpoints/runs/p1b_ema_robust_<date2>/best.pth \
+    checkpoints/runs/p1a_ema_<date>/best.pth \
+  --output checkpoints/soup_phase1.pth \
+  --report reports/soup_phase1.json
+```
+
+### Evaluate the candidate and the soup
+
+```bash
+python src/evaluate.py --weights checkpoints/soup_phase1.pth --split val --tta --no_amp
+python src/robustness.py --weights checkpoints/soup_phase1.pth \
+  --output_dir reports/soup_robustness --tta --no_amp
+```
+
+### Validation precision and EMA safety
+
+- The **EMA candidate is validated in FP32**, and the per-epoch robustness monitor
+  also runs in FP32, matching the submitted inference recipe. This avoids rare fp16
+  overflow from BatchNorm statistics that were just recalibrated on a clean subset;
+  the raw model still uses AMP during validation for speed.
+- If EMA validation ever yields non-finite probabilities, training logs a warning and
+  falls back to the raw model for that epoch instead of crashing.
+- `best.pth` records `checkpoint_type` (`ema`/`raw`), `selection_metric`,
+  `selection_score`, `clean_auc`, `degraded_aucs` and `monitor_variants`, so the
+  selected checkpoint is auditable.
+- Smoke-tested locally with ResNet-50, 8 train / 8 val, 1 epoch, both
+  `--ema_bn_batches 1` (worst case) and the production `--ema_bn_batches 100`:
+  EMA validation, composite selection, the robustness monitor and checkpoint save
+  all complete without NaN.
+
+Expected runtime: ~20–30 min per run on a T4 (ResNet-50, 15 epochs, 5,600 images,
+plus EMA validation and the 3-variant monitor). Phase 1 budget: 3–5 runs,
+**~2–3 GPU hours** (leave margin for Kaggle restarts).
 
 ## 5. Outputs to download
 

@@ -174,6 +174,7 @@ def evaluate_variant(
     num_workers: int,
     tta: bool,
     amp: bool,
+    verbose: bool = True,
 ) -> Dict[str, Any]:
     loader = DataLoader(
         DeepfakeDataset(dataframe, build_variant_transform(name, img_size, eval_resize)),
@@ -185,7 +186,9 @@ def evaluate_variant(
         persistent_workers=num_workers > 0,
         prefetch_factor=2 if num_workers > 0 else None,
     )
-    outputs = predict_loader(model, loader, device, tta=tta, amp=amp, desc=f"robust {name}")
+    outputs = predict_loader(
+        model, loader, device, tta=tta, amp=amp, desc=f"robust {name}" if verbose else None
+    )
     metrics = compute_metrics(outputs["labels"], outputs["probs"], threshold=0.5)
     metrics.update(
         {
