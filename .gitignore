@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Experiment tracking / training artefacts
+mlruns/
+checkpoints/
+reports/
+checkpoints_smoke/
+reports_smoke/
+logs/
+*.log
+
+# Model binaries
+*.pth
+*.pt
+*.part
+*.safetensors
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Claude configuration
+claude.md
+CLAUDE.md
+
+.vscode

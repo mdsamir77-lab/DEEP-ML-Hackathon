@@ -1,0 +1,16 @@
+{
+  "amp": true,
+  "arch": "resnet50",
+  "device": "cuda",
+  "elapsed_seconds": 37.82,
+  "images_per_second": 79.32,
+  "mean_confidence": 0.5309852361679077,
+  "num_images": 3000,
+  "precision": "amp (fp16 autocast)",
+  "predicted_fake_fraction": 0.5156666666666667,
+  "sample_submission": "hackathon_dataset\\sample_submission.csv",
+  "sample_submission_order": true,
+  "threshold": 0.5,
+  "tta": true,
+  "unique_confidences": 1591
+}
