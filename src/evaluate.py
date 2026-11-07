@@ -36,12 +36,12 @@ from dataset import (  # noqa: E402
 from model import load_model_from_checkpoint  # noqa: E402
 from utils import (  # noqa: E402
     compute_metrics,
+    configure_deterministic_inference,
     get_device,
     plot_confusion_matrix,
     plot_roc_curve,
     predict_loader,
     save_json,
-    seed_everything,
 )
 
 
@@ -79,7 +79,7 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
 
 def main(argv: Any = None) -> Dict[str, Any]:
     args = parse_args(argv)
-    seed_everything(args.seed)
+    configure_deterministic_inference(seed=args.seed)
     device = get_device()
 
     model, checkpoint = load_model_from_checkpoint(args.weights, device=device)

@@ -160,9 +160,15 @@ def load_image(path: str | Path) -> Image.Image:
 
 
 class DeepfakeDataset(Dataset):
-    """Face-crop dataset returning ``{"image", "label", "image_id"}`` dicts."""
+    """Face-crop dataset returning ``{"image", "label", "image_id", "load_ok"}`` dicts."""
 
-    def __init__(self, dataframe: pd.DataFrame, transform: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        dataframe: pd.DataFrame,
+        transform: Optional[Any] = None,
+        fallback_on_error: bool = False,
+        fallback_size: int = 224,
+    ) -> None:
         required = {"image_id", "path"}
         missing = required - set(dataframe.columns)
         if missing:
@@ -170,17 +176,37 @@ class DeepfakeDataset(Dataset):
         self.dataframe = dataframe.reset_index(drop=True)
         self.transform = transform
         self.has_labels = "label" in self.dataframe.columns
+        self.fallback_on_error = bool(fallback_on_error)
+        self.fallback_size = int(fallback_size)
 
     def __len__(self) -> int:
         return len(self.dataframe)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         row = self.dataframe.iloc[index]
-        image = load_image(row["path"])
+        load_ok = True
+        try:
+            image = load_image(row["path"])
+        except Exception as exc:
+            if not self.fallback_on_error:
+                raise
+            # A single unreadable test image must not abort the whole submission:
+            # every image_id still gets a model-generated prediction.
+            load_ok = False
+            print(
+                f"[dataset] failed to load {row['path']}: {exc}; using gray fallback",
+                flush=True,
+            )
+            image = Image.new("RGB", (self.fallback_size, self.fallback_size), (128, 128, 128))
         if self.transform is not None:
             image = self.transform(image)
         label = int(row["label"]) if self.has_labels else -1
-        return {"image": image, "label": label, "image_id": str(row["image_id"])}
+        return {
+            "image": image,
+            "label": label,
+            "image_id": str(row["image_id"]),
+            "load_ok": load_ok,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -287,9 +313,18 @@ def create_test_loader(
     eval_resize: Optional[int] = None,
     pin_memory: bool = True,
 ) -> DataLoader:
-    """Inference loader for an unlabelled test dataframe."""
+    """Inference loader for an unlabelled test dataframe.
+
+    ``fallback_on_error=True`` guarantees one prediction row per test image even
+    if a file is corrupt or unreadable.
+    """
     return DataLoader(
-        DeepfakeDataset(test_df, build_eval_transform(img_size, eval_resize)),
+        DeepfakeDataset(
+            test_df,
+            build_eval_transform(img_size, eval_resize),
+            fallback_on_error=True,
+            fallback_size=img_size,
+        ),
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,

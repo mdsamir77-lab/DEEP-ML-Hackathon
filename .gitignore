@@ -8,12 +8,16 @@ venv/
 
 # Experiment tracking / training artefacts
 mlruns/
+mlflow.db
 checkpoints/
 reports/
 checkpoints_smoke/
 reports_smoke/
 logs/
 *.log
+
+# Dataset (provided by the organizers; not part of the code repository)
+hackathon_dataset/
 
 # Model binaries
 *.pth

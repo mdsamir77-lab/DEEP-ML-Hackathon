@@ -1,8 +1,9 @@
 """Batched inference over an unlabelled test directory.
 
-Defaults reproduce the submitted recipe: horizontal-flip TTA **on** and AMP
-(fp16 autocast) on CUDA, falling back to FP32 on CPU. Both can be changed
-explicitly (``--no_tta``, ``--no_amp``).
+Submitted recipe: horizontal-flip TTA **on**, **FP32** and deterministic CUDA
+settings. FP32 is used because fp16 convolution results can differ between GPU
+architectures (RTX 3050 vs the evaluator's T4); FP32 matched AMP on the held-out
+split and still fits the 5-minute budget. ``--amp`` opts into fp16 autocast.
 
 Example
 -------
@@ -13,12 +14,17 @@ python src/inference.py --test_dir hackathon_dataset/test/images \
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import pandas as pd
+
+# Must be set before CUDA is initialised (torch is imported by ``model`` below).
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
@@ -26,7 +32,13 @@ if str(SRC_DIR) not in sys.path:
 
 from dataset import build_test_dataframe, create_test_loader  # noqa: E402
 from model import load_model_from_checkpoint  # noqa: E402
-from utils import get_device, predict_loader, save_json  # noqa: E402
+from utils import (  # noqa: E402
+    configure_deterministic_inference,
+    environment_info,
+    get_device,
+    predict_loader,
+    save_json,
+)
 
 
 def parse_args(argv: Any = None) -> argparse.Namespace:
@@ -53,14 +65,15 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
     parser.add_argument(
         "--amp",
         action="store_true",
-        default=True,
-        help="half-precision CUDA autocast (default: the measured best recipe on this GPU)",
+        default=False,
+        help="fp16 CUDA autocast (faster; NOT the submitted recipe because fp16 "
+        "results can differ across GPU architectures)",
     )
     parser.add_argument(
         "--no_amp",
         dest="amp",
         action="store_false",
-        help="force FP32 inference (full-precision logits, ~2x slower, more unique confidences)",
+        help="force FP32 inference (default: the submitted recipe)",
     )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(
@@ -69,6 +82,7 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
         default=None,
         help="optional CSV used to order rows when its image_id set matches the test images",
     )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true", default=False)
     return parser.parse_args(argv)
 
@@ -114,6 +128,67 @@ def _order_like_sample_submission(
     return ordered, True
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_submission_csv(
+    path: Path,
+    expected_ids: Sequence[str],
+    threshold: float,
+    sample_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Fail loudly if the written CSV violates the submission contract."""
+    frame = pd.read_csv(path)
+    problems: list[str] = []
+
+    if list(frame.columns) != ["image_id", "label", "confidence"]:
+        problems.append(
+            f"columns are {list(frame.columns)}, expected ['image_id', 'label', 'confidence']"
+        )
+    if len(frame) != len(expected_ids):
+        problems.append(f"row count is {len(frame)}, expected {len(expected_ids)}")
+    if frame["image_id"].duplicated().any():
+        problems.append(f"{int(frame['image_id'].duplicated().sum())} duplicate image_id rows")
+    frame_ids = frame["image_id"].astype(str)
+    expected_set = set(map(str, expected_ids))
+    if set(frame_ids) != expected_set:
+        missing = len(expected_set - set(frame_ids))
+        extra = len(set(frame_ids) - expected_set)
+        problems.append(f"image_id set mismatch (missing={missing}, extra={extra})")
+    confidence = pd.to_numeric(frame["confidence"], errors="coerce")
+    if confidence.isna().any():
+        problems.append(f"{int(confidence.isna().sum())} non-numeric confidence values")
+    elif ((confidence < 0.0) | (confidence > 1.0)).any():
+        problems.append("confidence outside [0, 1]")
+    if not frame["label"].isin([0, 1]).all():
+        problems.append("label contains values outside {0, 1}")
+    elif not frame["label"].astype(int).equals((confidence >= threshold).astype(int)):
+        problems.append(f"label != int(confidence >= {threshold})")
+    if sample_path is not None and sample_path.is_file():
+        sample = pd.read_csv(sample_path)
+        sample_ids = sample["image_id"].astype(str)
+        if set(sample_ids) != set(frame_ids):
+            problems.append("image_id set does not match sample_submission.csv")
+        elif list(sample_ids) != list(frame_ids):
+            problems.append("row order does not match sample_submission.csv")
+
+    if problems:
+        raise RuntimeError("Submission CSV validation failed:\n- " + "\n- ".join(problems))
+
+    return {
+        "rows": int(len(frame)),
+        "unique_ids": int(frame["image_id"].nunique()),
+        "confidence_min": float(confidence.min()),
+        "confidence_max": float(confidence.max()),
+        "predicted_fake_fraction": float(frame["label"].mean()),
+    }
+
+
 def run_inference(
     test_dir: str | Path,
     weights: str | Path,
@@ -123,12 +198,14 @@ def run_inference(
     img_size: int = 0,
     eval_resize: int = 0,
     tta: bool = True,
-    amp: bool = True,
+    amp: bool = False,
     threshold: float = 0.5,
     force_cpu: bool = False,
     sample_submission: str | Path | None = None,
+    seed: int = 42,
 ) -> pd.DataFrame:
     """Run inference and write the submission CSV (image_id, label, confidence)."""
+    configure_deterministic_inference(seed=seed)
     device = get_device(prefer_cuda=not force_cpu)
     model, checkpoint = load_model_from_checkpoint(weights, device=device)
     config = checkpoint.get("config", {}) or {}
@@ -147,6 +224,10 @@ def run_inference(
     started = time.time()
     outputs = predict_loader(model, loader, device, tta=tta, amp=amp, desc="inference")
     elapsed = time.time() - started
+    if len(outputs["image_ids"]) != len(test_df):
+        raise RuntimeError(
+            f"Model returned {len(outputs['image_ids'])} predictions for {len(test_df)} test images"
+        )
 
     frame = pd.DataFrame(
         {
@@ -162,6 +243,13 @@ def run_inference(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(output_path, index=False)
 
+    validation = _validate_submission_csv(
+        output_path,
+        expected_ids=[str(x) for x in test_df["image_id"]],
+        threshold=threshold,
+        sample_path=sample_path,
+    )
+
     summary = {
         "num_images": int(len(frame)),
         "elapsed_seconds": round(elapsed, 2),
@@ -170,6 +258,8 @@ def run_inference(
         "tta": bool(outputs["tta"]),
         "amp": bool(outputs["amp"]),
         "precision": "amp (fp16 autocast)" if outputs["amp"] else "fp32",
+        "deterministic": True,
+        "seed": int(seed),
         "threshold": float(threshold),
         "predicted_fake_fraction": float(frame["label"].mean()) if len(frame) else 0.0,
         "mean_confidence": float(frame["confidence"].mean()) if len(frame) else 0.0,
@@ -177,6 +267,12 @@ def run_inference(
         "sample_submission": str(sample_path) if sample_path is not None else None,
         "sample_submission_order": bool(ordered),
         "arch": checkpoint.get("arch"),
+        "checkpoint_sha256": _sha256(Path(weights)),
+        "output_sha256": _sha256(output_path),
+        "num_load_failures": int(outputs.get("num_load_failures", 0)),
+        "load_failures": outputs.get("load_failures", []),
+        "validation": validation,
+        "environment": environment_info(),
     }
     save_json(summary, output_path.with_suffix(".summary.json"))
     print(f"Wrote {len(frame)} predictions -> {output_path}")
@@ -199,6 +295,7 @@ def main(argv: Any = None) -> pd.DataFrame:
         threshold=args.threshold,
         force_cpu=args.cpu,
         sample_submission=args.sample_submission,
+        seed=args.seed,
     )
 
 

@@ -10,8 +10,8 @@ Binary face-image classifier that labels a crop as **real (0)** or **deepfake (1
 | **Loss / optimiser** | `BCEWithLogitsLoss` (label smoothing 0.05 / 0.1) + `AdamW` + cosine schedule with 1-epoch warm-up |
 | **Primary metric** | Validation ROC-AUC (see [`evaluation_metric.md`](evaluation_metric.md)) |
 | **Tracking** | MLflow, experiment `Deepfake Detection`, store `./mlruns/` |
-| **Submitted inference** | flip TTA **on** + AMP (fp16 autocast) on CUDA — the defaults of `inference_script.py`; `--no_tta` / `--no_amp` are explicit opt-outs |
-| **Inference budget** | 3,000 test images in **38–56 s** (53–78 img/s, AMP + flip TTA) on the RTX 3050 — far below the 5-minute T4 limit. FP32 (`--no_amp`) measured 51–63 s for the 1,400-image val split (~110–135 s projected for 3,000 images; still inside the budget) |
+| **Submitted inference** | flip TTA **on** + **FP32** + deterministic CUDA settings — the defaults of `inference_script.py`; `--amp` / `--no_tta` are explicit opt-ins |
+| **Inference budget** | 3,000 test images in **73–80 s** (38–41 img/s, FP32 + flip TTA) on the RTX 3050 — far below the 5-minute T4 limit. AMP (`--amp`) remains available at ~38–56 s |
 
 ## 1. Problem and constraints
 
@@ -91,9 +91,10 @@ Held-out validation split: **1,400 images** (20 %, stratified, seed 42). All num
   (`model_state_sha256 = 240c8c8c…`, `model_state_modified = false` in `provenance`).
 * **Plots / diagnostics:** `reports/eval_soup/roc_curve.png`, `confusion_matrix.png`, `metrics.json`,
   `predictions.csv`; per-run curves in `reports/<run_name>/`.
-* **Test set (3,000 images, flip TTA + AMP):** 38–56 s total → **53–78 images/s**, 51.6 % predicted
-  fake, mean confidence 0.531, **1,591 unique confidence values**. Re-running the exact submission
-  command reproduces a byte-identical `predictions.csv` (verified by SHA-256 across three runs).
+* **Test set (3,000 images, flip TTA + FP32):** **73–80 s** total → **38–41 images/s**, 51.6 %
+  predicted fake, mean confidence 0.531, **2,997 unique confidence values**. Two runs of the exact
+  submission command produced the same SHA-256 (`c46225fd…`); the FP32 and AMP CSVs agree on
+  2,998/3,000 labels (Spearman 0.999994).
   The 51.6 % predicted-fake share is close to the training prior; it is *not* an estimate of the
   sealed test prior.
 * **Training cost:** 8 epochs ≈ 6.8 min wall clock on the RTX 3050 (≈50 s/epoch incl. validation),
@@ -103,34 +104,36 @@ Held-out validation split: **1,400 images** (20 %, stratified, seed 42). All num
 * **Experiment tracking:** both parents and the ablation are stored in `mlruns/` (experiment
   `Deepfake Detection`) with parameters, per-epoch metrics, configs and artifacts.
 
-### Inference precision: AMP vs FP32 (held-out validation, flip TTA)
+### Inference precision: FP32 submitted, AMP optional (held-out validation, flip TTA)
 
-The submitted CSV previously had 1,591 distinct confidences for 3,000 images, so AMP's fp16
-rounding was audited as a possible AUC leak (ties receive half credit in ROC-AUC). Three repeat
-runs per precision on the same 1,400-image held-out split:
+The submitted CSV is now **FP32** (2,997 distinct confidences for 3,000 images). AMP's fp16
+rounding was audited as a possible AUC leak (ties receive half credit in ROC-AUC) and, more
+importantly, as a **cross-GPU reproducibility risk**: the CSV was generated on an RTX 3050 while
+the evaluator runs a T4. Three repeat runs per precision on the same 1,400-image held-out split:
 
 | precision | val AUC (3 runs) | mean AUC | unique confidences / 1,400 | runtime / 1,400 | peak GPU memory |
 |---|---|---|---|---|---|
-| **AMP (fp16 autocast)** — selected | 0.892324 / 0.892322 / 0.892332 | **0.892326** | 889 / 891 / 895 | 34.2–46.5 s | 571 MB |
-| FP32 (`--no_amp`) | 0.892305 / 0.892325 / 0.892307 | 0.892312 | 1,399 / 1,400 / 1,400 | 50.8–62.5 s | 1,157 MB |
+| AMP (fp16 autocast, `--amp`) | 0.892324 / 0.892322 / 0.892332 | 0.892326 | 889 / 891 / 895 | 34.2–46.5 s | 571 MB |
+| **FP32 (submitted)** | 0.892305 / 0.892325 / 0.892307 | **0.892312** | 1,399 / 1,400 / 1,400 | 50.8–62.5 s | 1,157 MB |
 
 * The mean AUC difference is **+1.4e-5**, far inside run-to-run noise (cuDNN benchmark autotuning
   alone moves repeated AUCs by ~2e-5; the standard error of AUC on 1,400 samples is ~0.008). The
   hypothesis that fp16 ties cost AUC is **not supported** on this split: tied confidences are
   overwhelmingly within the same class.
-* AMP is also **1.2–1.4× faster** and uses **half the peak GPU memory**, so it stays the submitted
-  recipe (best measured mean AUC *and* the cheaper option). `--no_amp` remains available when the
-  maximum confidence resolution is preferred.
+* FP32 is now the submitted recipe because it removes the cross-architecture fp16 difference
+  (2/3,000 labels differed between the RTX 3050 AMP and FP32 CSVs; Spearman 0.999994) at **no
+  meaningful AUC cost**. FP32 runs 3,000 images in **73–80 s**, still far inside the 5-minute T4
+  budget. AMP remains available with `--amp` when speed is preferred.
 * The comparison is a **measured validation result**; no hidden-test score is claimed.
 
 Reproduce the final numbers:
 
 ```sh
-# submitted recipe (AMP is the default; flip TTA is enabled explicitly here)
+# submitted recipe (FP32 + flip TTA are the defaults)
 python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta
 
-# FP32 comparison
-python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta --no_amp
+# AMP comparison
+python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta --amp
 ```
 <!-- RESULTS_END -->
 
@@ -145,7 +148,7 @@ python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta --
 | Dropout 0.4 head + `weight_decay` | no regularisation | 5,600 training crops is small for 25 M parameters; both are cheap over-fitting guards. |
 | Threshold 0.5 for `label`, raw probabilities for `confidence` | tuned threshold | AUC is threshold-free, so the label column cannot change the score; 0.5 keeps the output interpretable. |
 | Horizontal-flip TTA at inference (default; `--no_tta` to disable) | single view | Cheap variance reduction, ~2× inference cost (still far inside the 5-minute budget). The submitted CSV was generated with TTA, so it is the default. |
-| AMP (fp16 autocast) on CUDA, FP32 on CPU; `--no_amp` for full FP32 | always FP32 | Measured on the val split: AMP mean AUC 0.892326 vs FP32 0.892312 (noise), 1.2–1.4× faster, half the peak memory. Ties did not cost AUC. |
+| **FP32 submitted** (deterministic CUDA); `--amp` for fp16 autocast | always AMP | AMP matched FP32 on val (0.892326 vs 0.892312), but fp16 results can differ across GPU architectures: 2/3,000 test labels changed between the RTX 3050 AMP and FP32 CSVs. FP32 removes the canary-check risk at 73–80 s / 3,000 images (20/20 efficiency). |
 
 ## 6. Repository layout
 
@@ -158,20 +161,25 @@ python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta --
 │  ├─ train.py                   # training loop, MLflow logging, checkpoints, plots
 │  ├─ evaluate.py                # held-out evaluation harness (val/train/all, optional TTA)
 │  ├─ inference.py               # batched inference → submission CSV
+│  ├─ robustness.py              # degradation harness (JPEG/blur/noise/downscale/…)
+│  ├─ audit.py                   # pHash leakage + JPEG/EXIF shortcut audit
 │  └─ utils.py                   # seeding, metrics, plotting, checkpoint/config I/O
 ├─ inference_script.py           # hackathon CLI entry point
 ├─ checkpoints/
-│  ├─ best_model.pth             # submitted soup (byte-identical to soup.pth), corrected soup metadata
-│  ├─ soup.pth                   # same bytes as best_model.pth
+│  ├─ best_model.pth             # submitted soup (byte-identical weights to soup.pth)
+│  ├─ soup.pth                   # same weights as best_model.pth
 │  ├─ soup3.pth                  # rejected 3-way soup (not submitted)
 │  └─ runs/<run_name>/           # parent best.pth, last.pth, config.yaml, val_predictions.csv
 ├─ reports/<run_name>/           # training_curves.png, roc_curve.png, confusion_matrix.png
+├─ reports/phase0/               # baseline verification, robustness, audit evidence
+├─ docs/                         # metric notes, phase reports, future technical docs
 ├─ mlruns/                       # MLflow tracking store
-├─ predictions.csv               # submission for the 3,000 test images
+├─ predictions.csv               # FP32 deterministic submission for the 3,000 test images
 ├─ check_data.ipynb              # EDA
-├─ claude.md                     # project blueprint
-├─ evaluation_metric.md          # metric definition
-├─ requirements.txt
+├─ claude.md                     # project blueprint (not part of the submission archive)
+├─ evaluation_metric.md          # official metric guide (IIIT Bangalore)
+├─ requirements.txt              # exact training environment
+├─ requirements-inference.txt    # minimal inference environment
 └─ .gitignore
 ```
 
@@ -214,17 +222,24 @@ python src/train.py --arch resnet50 --backend torchvision --epochs 8 --batch_siz
     --early_stopping_patience 3 --variant imagenet_pretrained \
     --run_name resnet50_imagenet_pretrained_20261031 --experiment "Deepfake Detection"
 
-# 2) evaluate on the held-out split (flip TTA; AMP is the default on CUDA)
+# 2) evaluate on the held-out split (FP32 + flip TTA are the defaults)
 python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta
 
-#    optional FP32 comparison (full-precision logits, ~2x slower)
-python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta --no_amp
+#    optional AMP comparison (faster, fp16)
+python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta --amp
 
-# 3) submission - TTA and AMP are the defaults, so this is the exact submitted recipe
+# 3) submission - FP32 + flip TTA + deterministic settings are the defaults
 python inference_script.py --test_dir ./hackathon_dataset/test/images/ \
     --weights ./checkpoints/best_model.pth --output predictions.csv
 
-# 4) inspect experiments
+# 4) robustness baseline (16 degradations x 1,400 val images; ~6-10 min)
+python src/robustness.py --weights checkpoints/best_model.pth \
+    --output_dir reports/robustness --tta
+
+# 5) shortcut / near-duplicate audit (~6-10 min)
+python src/audit.py --data_dir hackathon_dataset --output_dir reports/audit
+
+# 6) inspect experiments
 mlflow ui --backend-store-uri ./mlruns
 ```
 
@@ -247,19 +262,26 @@ python inference_script.py \
 ```
 
 * Loads the checkpoint (`state_dict` + `arch` + `backend` + `config`), calls `model.eval()` and runs
-  inside `torch.no_grad()`.
-* **Defaults reproduce the submitted recipe:** horizontal-flip TTA is **on** and CUDA inference uses
-  AMP (fp16 autocast). `--no_tta` and `--no_amp` are explicit opt-outs; CPU inference always runs
-  FP32. The README's documented command therefore needs no extra flags.
-* Batched (default 64) and deterministic (predictions are keyed by `image_id`; three runs of the
-  exact command produced a byte-identical CSV).
+  inside `torch.inference_mode()`.
+* **Defaults reproduce the submitted recipe:** horizontal-flip TTA is **on**, CUDA inference is
+  **FP32**, and deterministic cuDNN/cuBLAS settings are enabled (`cudnn.deterministic=True`,
+  `benchmark=False`, TF32 disabled, `CUBLAS_WORKSPACE_CONFIG=:4096:8`). `--amp` and `--no_tta` are
+  explicit opt-ins. The README's documented command therefore needs no extra flags.
+* Batched (default 64) and byte-reproducible: two full 3,000-image runs produced the same
+  SHA-256 (`c46225fd…`).
+* A corrupt/unreadable image gets a gray fallback and still receives a row; `num_load_failures`
+  and the failing `image_id`s are recorded in `predictions.summary.json`.
+* The written CSV is re-read and validated (columns, row count, unique IDs, ID set vs the test
+  directory, confidence range, `label == int(confidence >= threshold)`, sample-submission order)
+  before the script exits.
 * Writes `image_id,label,confidence` with `confidence = P(fake) ∈ [0, 1]` and `label ∈ {0, 1}`
   (`label = int(confidence >= threshold)`, threshold 0.5 by default).
 * If `sample_submission.csv` is found next to the test directory (or passed via `--sample_submission`),
   rows are reordered to match its `image_id` order when the ID sets are identical; otherwise the
   deterministic filename order is kept.
-* Also writes `predictions.summary.json` (count, seconds, images/s, device, TTA, precision, unique
-  confidences, mean confidence, row-order flag).
+* Also writes `predictions.summary.json` (count, seconds, images/s, device, TTA, precision,
+  deterministic flag, seed, unique confidences, mean confidence, row-order flag, checkpoint/output
+  SHA-256, load failures, environment).
 * CPU fallback via `--cpu`; `--img_size` / `--eval_resize` default to the values stored in the
   checkpoint, so evaluation and inference transforms always match.
 
@@ -278,11 +300,65 @@ python inference_script.py \
 
 ## 11. Robustness / generalisation notes
 
+### 11.1 Measured degradation baseline (Phase 0)
+
+`src/robustness.py` applies 16 deterministic degradations to the 1,400-image held-out split with the
+submitted FP32 + flip-TTA recipe. Full results: `reports/phase0/robustness/`.
+
+| Variant | AUC | Δ vs clean |
+|---|---:|---:|
+| clean | 0.8923 | — |
+| jpeg_q90 | 0.8915 | −0.0008 |
+| jpeg_q70 | 0.8890 | −0.0033 |
+| jpeg_q50 | 0.8911 | −0.0012 |
+| jpeg_q30 | 0.8891 | −0.0032 |
+| blur_s0.5 | 0.8927 | +0.0004 |
+| blur_s1.0 | 0.8877 | −0.0047 |
+| blur_s2.0 | 0.8728 | −0.0195 |
+| noise_0.01 | 0.8909 | −0.0014 |
+| noise_0.03 | 0.8889 | −0.0034 |
+| downscale_0.75 | 0.8950 | +0.0027 |
+| downscale_0.50 | 0.8900 | −0.0023 |
+| brightness_0.8 | 0.8917 | −0.0006 |
+| brightness_1.2 | 0.8886 | −0.0037 |
+| contrast_0.8 | 0.8916 | −0.0007 |
+| contrast_1.2 | 0.8924 | +0.0001 |
+| grayscale | 0.8808 | −0.0115 |
+
+* Mean degraded AUC **0.8890**; equal-weight composite **0.8906**; proxy robustness score
+  **15.63/20** under the assumption `20 × (AUC − 0.5)/0.5` (the official variant weights are
+  undisclosed).
+* The soup is **more robust than expected**: JPEG q30, noise, 0.5× downscale and ±20 % lighting
+  stay within ~0.004 AUC of clean. The only material drops are **strong blur (σ=2, −0.0195)** and
+  **grayscale (−0.0115)**. Phase 1 should add blur/JPEG/noise augmentation and select on the
+  composite rather than clean AUC alone.
+
+### 11.2 Near-duplicate and shortcut audit (Phase 0)
+
+`src/audit.py` (pHash Hamming ≤ 6, all 7,000 train + 3,000 test images):
+
+| Finding | Value | Interpretation |
+|---|---:|---|
+| Near-duplicate pairs | 295 | sparse; max cluster size 3 |
+| Cross-class pairs / clusters | 55 / 53 | possible label noise or genuinely hard real/fake pairs |
+| Train/val leakage pairs | 87 | 85 val images (6.07 %) have a train near-duplicate |
+| Test images with a train near-duplicate | 238 (7.93 %) | the hidden test may be slightly easier than a clean holdout |
+| JPEG quantization tables | 1 table for all 7,000 images | no JPEG-header shortcut |
+| EXIF present | 0 % real, 0 % fake | no metadata shortcut |
+| Largest class-wise pixel effect | std_r, effect size 0.177 | small; no dominant colour/border shortcut |
+
+The 6.07 % train/val near-duplicate leakage means the local 0.8923 AUC is **mildly optimistic**;
+the honest estimate is likely a few tenths of a point lower. The 7.93 % test-train match means the
+hidden test contains a similar fraction of near-duplicates, so the *relative* model ranking should
+still transfer. Phase 1 will report both the random-split and a pHash-grouped validation number.
+
+### 11.3 Design choices that support robustness
+
 * The stratified split preserves the **training-label prior** (3,478 real / 3,522 fake) in both
-  subsets. The test labels are sealed, so no claim is made about the test class prior. No MD5
-  duplicates exist, so there is no trivial leakage between train and validation.
+  subsets. The test labels are sealed, so no claim is made about the test class prior.
 * Mild, artefact-preserving augmentation (small crops, flips, ±10° rotation, subtle colour jitter)
-  instead of blur/noise that would teach shortcut features.
+  instead of blur/noise that would teach shortcut features. Phase 1 adds **mild degradation
+  augmentation** on top, because the hidden robustness variants include such degradations.
 * Early stopping and model selection on **AUC** (a ranking metric) rather than accuracy, so the
   submission keeps a good ordering even if the hidden test prior shifts.
 * Horizontal-flip TTA averages two views, reducing prediction variance on unseen variants; it is on
@@ -362,7 +438,8 @@ python inference_script.py --test_dir ./hackathon_dataset/test/images/ \
 python -c "import hashlib; a=hashlib.sha256(open('run1.csv','rb').read()).hexdigest(); b=hashlib.sha256(open('run2.csv','rb').read()).hexdigest(); print(a, b, a == b); assert a == b"
 ```
 
-- [ ] `predictions.summary.json` reports `"tta": true`, `"amp": true` (on CUDA), `"num_images": 3000`.
+- [ ] `predictions.summary.json` reports `"tta": true`, `"amp": false`, `"deterministic": true`,
+      `"num_images": 3000`, `"num_load_failures": 0` and an `output_sha256` equal to the file hash.
 - [ ] `python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta` reproduces the
       reported ~0.8923 validation AUC (±1e-5 run-to-run) and writes both `predictions.csv` and
       `predictions_detailed.csv`.

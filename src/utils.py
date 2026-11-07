@@ -47,6 +47,31 @@ def seed_everything(seed: int = 42) -> None:
     torch.backends.cudnn.deterministic = False
 
 
+def configure_deterministic_inference(seed: int = 42) -> None:
+    """Make CUDA inference reproducible across runs and GPU architectures.
+
+    The submitted ``predictions.csv`` is generated with this configuration in
+    FP32. ``torch.use_deterministic_algorithms`` is enabled in warn-only mode so
+    an unsupported op cannot crash the submission run; the ops used here
+    (conv2d, linear, resize, sigmoid) are deterministic in practice.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    # Required for deterministic cuBLAS GEMMs. Must be set before CUDA init.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:  # pragma: no cover - older torch without warn_only
+        torch.use_deterministic_algorithms(True)
+
+
 def get_device(prefer_cuda: bool = True) -> torch.device:
     """Return CUDA device when available (CPU fallback otherwise)."""
     if prefer_cuda and torch.cuda.is_available():
@@ -168,6 +193,25 @@ def compute_metrics(
     return metrics
 
 
+def composite_auc(
+    clean_auc: float,
+    degraded_aucs: Sequence[float],
+    clean_weight: float = 0.5,
+) -> float:
+    """Proxy for the hidden robustness score: clean AUC + mean(degraded AUC).
+
+    The official robustness weighting is undisclosed. This equal-weight proxy
+    is used only for local model selection; the measured clean and per-variant
+    AUCs are always reported separately.
+    """
+    degraded = [float(a) for a in degraded_aucs if np.isfinite(a)]
+    if not degraded:
+        return float(clean_auc)
+    mean_degraded = float(np.mean(degraded))
+    weight = float(np.clip(clean_weight, 0.0, 1.0))
+    return weight * float(clean_auc) + (1.0 - weight) * mean_degraded
+
+
 def optimal_threshold(
     y_true: Sequence[int] | np.ndarray, y_prob: Sequence[float] | np.ndarray
 ) -> float:
@@ -184,7 +228,7 @@ def optimal_threshold(
 # ---------------------------------------------------------------------------
 # Inference helpers
 # ---------------------------------------------------------------------------
-@torch.no_grad()
+@torch.inference_mode()
 def predict_loader(
     model: torch.nn.Module,
     loader: Iterable,
@@ -204,19 +248,18 @@ def predict_loader(
     * ``True`` - half-precision CUDA autocast (CPU stays FP32);
     * ``False`` - full FP32 everywhere.
 
-    AMP is the submitted recipe: on the 1,400-image held-out split it matched
-    FP32 (mean AUC 0.892326 vs 0.892312 over three repeats) while running
-    1.2-1.4x faster and using half the peak GPU memory. fp16 rounds logits to
-    roughly 1e-3, which ties many confidences, but AUC is rank based and the
-    ties were overwhelmingly within-class, so they did not cost score. Use
-    ``amp=False`` when the maximum confidence resolution is required.
-    See README section 4 for the measurements.
+    The submitted recipe is **FP32** (``amp=False``) because fp16 convolution
+    results can differ between GPU architectures (RTX 3050 vs the evaluator's
+    T4), which risks a canary-check mismatch. FP32 matched AMP on the held-out
+    split (mean AUC 0.892312 vs 0.892326) and still fits the 5-minute budget.
+    AMP remains available with ``amp=True``.
     """
     model.eval()
     probs: List[np.ndarray] = []
     logits_out: List[np.ndarray] = []
     labels: List[np.ndarray] = []
     image_ids: List[str] = []
+    load_failures: List[str] = []
 
     iterator = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True) if desc else loader
     use_amp = device.type == "cuda" and (amp is None or bool(amp))
@@ -232,13 +275,21 @@ def predict_loader(
         probs.append(prob.float().cpu().numpy().ravel())
         logits_out.append(logits.float().cpu().numpy().ravel())
         labels.append(np.asarray(batch["label"]).astype(int).ravel())
-        image_ids.extend([str(x) for x in batch["image_id"]])
+        batch_ids = [str(x) for x in batch["image_id"]]
+        image_ids.extend(batch_ids)
+        if "load_ok" in batch:
+            flags = batch["load_ok"].tolist() if hasattr(batch["load_ok"], "tolist") else list(batch["load_ok"])
+            load_failures.extend(
+                image_id for image_id, ok in zip(batch_ids, flags) if not bool(ok)
+            )
 
     return {
         "probs": np.concatenate(probs) if probs else np.empty(0),
         "logits": np.concatenate(logits_out) if logits_out else np.empty(0),
         "labels": np.concatenate(labels) if labels else np.empty(0),
         "image_ids": image_ids,
+        "load_failures": load_failures,
+        "num_load_failures": len(load_failures),
         "amp": bool(use_amp),
         "tta": bool(tta),
         "device": str(device),

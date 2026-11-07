@@ -1,16 +1,41 @@
 {
-  "amp": true,
+  "amp": false,
   "arch": "resnet50",
+  "checkpoint_sha256": "5aa283ee1aa7bc2748faf3a34d31a512576c482e4c5faa5ecf4e9ae7f4a4e41c",
+  "deterministic": true,
   "device": "cuda",
-  "elapsed_seconds": 37.82,
-  "images_per_second": 79.32,
-  "mean_confidence": 0.5309852361679077,
+  "elapsed_seconds": 83.63,
+  "environment": {
+    "cuda_available": true,
+    "cuda_version": "12.1",
+    "cudnn_version": 90100,
+    "device_count": 1,
+    "gpu_capability": "8.6",
+    "gpu_name": "NVIDIA GeForce RTX 3050 6GB Laptop GPU",
+    "gpu_total_memory_gb": 6.0,
+    "python": "3.10.20",
+    "timm": "1.0.30",
+    "torch": "2.5.1+cu121"
+  },
+  "images_per_second": 35.87,
+  "load_failures": [],
+  "mean_confidence": 0.5309762954711914,
   "num_images": 3000,
-  "precision": "amp (fp16 autocast)",
+  "num_load_failures": 0,
+  "output_sha256": "c46225fdb88ebb582969fe89eb83a84fb4189cd5b4bdce9634f83d7cb56a9ee1",
+  "precision": "fp32",
   "predicted_fake_fraction": 0.5156666666666667,
   "sample_submission": "hackathon_dataset\\sample_submission.csv",
   "sample_submission_order": true,
+  "seed": 42,
   "threshold": 0.5,
   "tta": true,
-  "unique_confidences": 1591
+  "unique_confidences": 2997,
+  "validation": {
+    "confidence_max": 0.9933784,
+    "confidence_min": 0.01786082,
+    "predicted_fake_fraction": 0.5156666666666667,
+    "rows": 3000,
+    "unique_ids": 3000
+  }
 }

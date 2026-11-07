@@ -1,8 +1,9 @@
 """Hackathon-compliant inference entry point.
 
-Defaults reproduce the submitted recipe: horizontal-flip TTA enabled and AMP
-(fp16 autocast) on CUDA, falling back to FP32 on CPU. ``--no_tta`` / ``--no_amp``
-are explicit opt-outs for faster or full-precision runs.
+The submitted recipe is horizontal-flip TTA enabled, **FP32**, and deterministic
+CUDA settings. FP32 avoids cross-GPU fp16 differences (RTX 3050 -> T4 canary
+check) and matched AMP on the held-out split while staying inside the 5-minute
+budget. ``--amp`` opts into fp16 autocast; ``--no_tta`` disables flip TTA.
 
 Usage
 -----
@@ -19,8 +20,12 @@ Output CSV columns: image_id,label,confidence
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# Deterministic cuBLAS requires this before CUDA initialisation.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 ROOT_DIR = Path(__file__).resolve().parent
 SRC_DIR = ROOT_DIR / "src"
