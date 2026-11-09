@@ -5,13 +5,13 @@ Binary face-image classifier that labels a crop as **real (0)** or **deepfake (1
 
 | | |
 |---|---|
-| **Backbone** | ResNet-50 (ImageNet-1k V2 weights, `torchvision`) + `Dropout → Linear(2048, 1)`; submitted weights = soup of two fine-tunes |
+| **Backbone** | ResNet-50 (ImageNet-1k V2 weights, `torchvision`) + `Dropout → Linear(2048, 1)`; submitted weights = **3-way soup of Phase 1 EMA fine-tunes** (Phase 0 soup retained as `best_model_phase0.pth`) |
 | **Input** | 224 × 224 RGB, ImageNet normalisation |
 | **Loss / optimiser** | `BCEWithLogitsLoss` (label smoothing 0.05 / 0.1) + `AdamW` + cosine schedule with 1-epoch warm-up |
 | **Primary metric** | Validation ROC-AUC (see [`evaluation_metric.md`](evaluation_metric.md)) |
 | **Tracking** | MLflow, experiment `Deepfake Detection`, store `./mlruns/` |
 | **Submitted inference** | flip TTA **on** + **FP32** + deterministic CUDA settings — the defaults of `inference_script.py`; `--amp` / `--no_tta` are explicit opt-ins |
-| **Inference budget** | 3,000 test images in **73–84 s** (36–41 img/s, FP32 + flip TTA) on the RTX 3050 — far below the 5-minute T4 limit. AMP (`--amp`) remains available at ~38–56 s |
+| **Inference budget** | 3,000 test images in **52 s on a T4** (57.7 img/s, FP32 + flip TTA) and **73–84 s on the RTX 3050** — far below the 5-minute limit. AMP (`--amp`) remains available for speed |
 
 ## 1. Problem and constraints
 
@@ -65,36 +65,46 @@ Training details (`src/train.py`):
 ## 4. Results
 
 <!-- RESULTS_START -->
-Held-out validation split: **1,400 images** (20 %, stratified, seed 42). All numbers come from
-`src/evaluate.py` on exactly that split; `TTA` = horizontal-flip test-time augmentation.
+Held-out validation split: **1,400 images** (20 %, stratified, seed 42). Phase 0 numbers come from
+`src/evaluate.py`; Phase 1 rows are the Kaggle training validation on the same split, and the soup
+row was reproduced exactly by the local `evaluate.py` (AUC 0.8962353872779518). `TTA` =
+horizontal-flip test-time augmentation.
 
 | # | recipe | val AUC | acc @0.5 | precision | recall | F1 | best thr. |
 |---|--------|---------|----------|-----------|--------|----|-----------|
 | 1 | baseline: lr 2e-4, dropout 0.4, wd 1e-4, 8 epochs (best = epoch 7) | 0.8806 | 0.8471 | 0.8441 | 0.8537 | 0.8489 | — |
 | 2 | baseline + flip TTA | 0.8846 | 0.8464 | 0.8410 | 0.8565 | 0.8487 | 0.413 |
 | 3 | regularised: lr 1e-4, dropout 0.5, wd 1e-2, LS 0.1, 12 epochs, val-TTA (best = epoch 4) | 0.8848 | 0.8221 | 0.7785 | 0.9034 | 0.8363 | 0.675 |
-| 4 | **checkpoint soup of #1 + #3, flip TTA → submitted model** | **0.8923** | **0.8586** | 0.8382 | 0.8906 | **0.8636** | 0.507 |
+| 4 | Phase 0 baseline: checkpoint soup of #1 + #3, flip TTA | 0.8923 | 0.8586 | 0.8382 | 0.8906 | 0.8636 | 0.507 |
 | 5 | ablation — same recipe as #3 but `--no_aug` (deterministic transform), 6 epochs (best = epoch 2) | 0.8797 | 0.8200 | 0.7943 | 0.8665 | 0.8288 | — |
+| 6 | Phase 1 P1-A: ResNet-50, EMA + mild aug, 15 epochs, clean-AUC selection | 0.8905 | 0.8493 | 0.8438 | 0.8594 | 0.8515 | 0.512 |
+| 7 | Phase 1 P1-B: EMA + robust aug (p=0.4), composite selection | 0.8903 | 0.8479 | 0.8453 | 0.8537 | 0.8495 | 0.631 |
+| 8 | Phase 1 P1-B seed 3: EMA + robust aug | 0.8893 | 0.8521 | 0.8535 | 0.8523 | 0.8529 | 0.654 |
+| 9 | **Phase 1 3-way soup of #6 + #7 + #8, flip TTA → submitted model** | **0.8962** | **0.8564** | 0.8567 | 0.8580 | **0.8573** | 0.398 |
 
 * **Ablation (augmentation, #3 vs #5):** with an otherwise identical recipe, disabling augmentation
   costs **−0.51 AUC** (0.8848 → 0.8797) and peaks 2 epochs earlier (it memorises the training set
   faster). Mild augmentation is therefore kept — but it stays *mild*, because heavy blur/noise would
   remove the forensic cues entirely.
-* **Rejected variant:** a 3-way soup (adding the no-aug model) scored 0.8913 AUC / 0.8471 acc —
-  slightly worse than the 2-way soup, so it was not shipped (`checkpoints/soup3.pth`).
-* **Submitted model:** `checkpoints/best_model.pth` = element-wise mean of the two best state dicts
-  (`checkpoints/soup.pth`). Model soup beats both parents (+0.75 AUC points) and, because the parents
-  were trained with different regularisation, their errors are partly decorrelated. Both files are
-  byte-identical (SHA-256 `e9d98944…`); their metadata now records the soup method, both parent
-  run names/checkpoints, the TTA validation recipe and the 0.8923 held-out AUC. The earlier metadata
-  incorrectly showed the baseline parent's epoch 7 / 0.8806 — `model_state` was never modified
-  (`model_state_sha256 = 240c8c8c…`, `model_state_modified = false` in `provenance`).
-* **Plots / diagnostics:** `reports/eval_soup/roc_curve.png`, `confusion_matrix.png`, `metrics.json`,
-  `predictions.csv`; per-run curves in `reports/<run_name>/`.
-* **Test set (3,000 images, flip TTA + FP32):** **73–84 s** total → **36–41 images/s**, 51.6 %
-  predicted fake, mean confidence 0.531, **2,997 unique confidence values**. Two runs of the exact
-  submission command produced the same SHA-256 (`c46225fd…`); the FP32 and AMP CSVs agree on
-  2,998/3,000 labels (Spearman 0.999994).
+* **Phase 0 rejected variant:** a 3-way soup (adding the no-aug model) scored 0.8913 AUC / 0.8471
+  acc — slightly worse than the 2-way soup, so it was not shipped (`checkpoints/soup3.pth`).
+* **Phase 1 submitted model:** `checkpoints/best_model.pth` = 3-way soup of the three Phase 1 EMA
+  runs (#6 + #7 + #8). The soup gains **+0.57 AUC points over its best parent** (0.8905 → 0.8962)
+  and **+0.39 over the Phase 0 soup** (0.8923 → 0.8962). The individual parents are below the Phase 0
+  soup; the soup is the Phase 1 win. The Phase 0 soup is retained as `checkpoints/best_model_phase0.pth`
+  for fallback. The Phase 1 soup file SHA-256 is `73770803…`; its state-dict hash `93e5a10b…` matches
+  the recomputed hash. Predictions SHA-256 `c81a551c…`.
+* **Phase 1 robustness (Kaggle, 17 variants):** composite **0.8950**, proxy **15.80/20**; clean
+  0.8962, worst `blur_s2.0` 0.8833, best `downscale_0.75` 0.8983. Every variant is within 0.013 AUC
+  of clean. Full table and analysis: [`docs/phase1_report.md`](docs/phase1_report.md).
+* **Phase 1 limitation:** clean AUC 0.8962 is still below the Phase 1 target (0.91–0.93). ResNet-50
+  has plateaued; Phase 2 (ConvNeXt-T / EfficientNet-B3 / Swin-T + ensemble) is required.
+* **Plots / diagnostics:** Phase 0 in `reports/eval_soup/`; Phase 1 in
+  `kagggle_out_phase_01/reports/eval_checkpoints_val/` and `.../soup_robustness/`.
+* **Test set (3,000 images, flip TTA + FP32, T4):** **52.0 s** total → **57.7 images/s**, 49.8 %
+  predicted fake, mean confidence 0.491, **2,999 unique confidence values**, 0 load failures,
+  SHA-256 `c81a551c…`. The local RTX 3050 FP32 run is 73–84 s. The Phase 0 FP32/AMP comparison
+  (2,998/3,000 labels, Spearman 0.999994) remains in `docs/phase0_report.md`.
   The 51.6 % predicted-fake share is close to the training prior; it is *not* an estimate of the
   sealed test prior.
 * **Training cost:** 8 epochs ≈ 6.8 min wall clock on the RTX 3050 (≈50 s/epoch incl. validation),
@@ -104,9 +114,9 @@ Held-out validation split: **1,400 images** (20 %, stratified, seed 42). All num
 * **Experiment tracking:** both parents and the ablation are stored in `mlruns/` (experiment
   `Deepfake Detection`) with parameters, per-epoch metrics, configs and artifacts.
 
-### Inference precision: FP32 submitted, AMP optional (held-out validation, flip TTA)
+### Phase 0 model — inference precision: FP32 submitted, AMP optional
 
-The submitted CSV is now **FP32** (2,997 distinct confidences for 3,000 images). AMP's fp16
+The Phase 0 CSV was generated in **FP32** (2,997 distinct confidences for 3,000 images). AMP's fp16
 rounding was audited as a possible AUC leak (ties receive half credit in ROC-AUC) and, more
 importantly, as a **cross-GPU reproducibility risk**: the CSV was generated on an RTX 3050 while
 the evaluator runs a T4. Three repeat runs per precision on the same 1,400-image held-out split:
@@ -129,12 +139,22 @@ the evaluator runs a T4. Three repeat runs per precision on the same 1,400-image
 Reproduce the final numbers:
 
 ```sh
-# submitted recipe (FP32 + flip TTA are the defaults)
+# Phase 0 model (FP32 + flip TTA)
+python src/evaluate.py --weights checkpoints/best_model_phase0.pth --split val --tta
+
+# Phase 1 submitted soup (FP32 + flip TTA)
 python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta
 
-# AMP comparison
-python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta --amp
+# AMP comparison (Phase 0 model)
+python src/evaluate.py --weights checkpoints/best_model_phase0.pth --split val --tta --amp
 ```
+
+**Phase 1 update:** the submitted soup was generated on a **T4** with FP32 + flip TTA: 3,000 images
+in **52.0 s**, 2,999 unique confidences, predictions SHA-256 `c81a551c…`. The local `evaluate.py`
+reproduced the Kaggle validation AUC exactly (**0.8962353872779518**), and the local robustness
+subset matched the Kaggle table exactly (clean 0.896235, jpeg_q50 0.894174, blur_s2.0 0.883331,
+grayscale 0.890786). The FP32/AMP table above is the Phase 0 model comparison and is retained for
+the canary-risk rationale.
 <!-- RESULTS_END -->
 
 ## 5. Design justification / ablation notes
@@ -163,18 +183,23 @@ python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta --
 │  ├─ inference.py               # batched inference → submission CSV
 │  ├─ robustness.py              # degradation harness (JPEG/blur/noise/downscale/…)
 │  ├─ audit.py                   # pHash leakage + JPEG/EXIF shortcut audit
-│  └─ utils.py                   # seeding, metrics, plotting, checkpoint/config I/O
+│  ├─ soup.py                    # weighted state-dict averaging (model soup)
+│  └─ utils.py                   # seeding, metrics, plotting, EMA, checkpoint/config I/O
 ├─ inference_script.py           # hackathon CLI entry point
 ├─ checkpoints/
-│  ├─ best_model.pth             # submitted soup (byte-identical weights to soup.pth)
-│  ├─ soup.pth                   # same weights as best_model.pth
-│  ├─ soup3.pth                  # rejected 3-way soup (not submitted)
+│  ├─ best_model.pth             # Phase 1 3-way soup (submitted; = best_model_phase1.pth)
+│  ├─ best_model_phase1.pth      # same bytes as best_model.pth
+│  ├─ best_model_phase0.pth      # Phase 0 2-way soup (fallback)
+│  ├─ soup.pth                   # Phase 0 soup (historical)
+│  ├─ soup3.pth                  # Phase 0 rejected 3-way soup
 │  └─ runs/<run_name>/           # parent best.pth, last.pth, config.yaml, val_predictions.csv
 ├─ reports/<run_name>/           # training_curves.png, roc_curve.png, confusion_matrix.png
 ├─ reports/phase0/               # baseline verification, robustness, audit evidence
-├─ docs/                         # metric notes, phase reports, future technical docs
+├─ reports/phase1_kaggle_verify/ # local reproduction of the Kaggle soup metrics
+├─ docs/                         # metric notes, Phase 0/1 reports, Kaggle handoff
+├─ kagggle_out_phase_01/         # Kaggle Phase 1 outputs (checkpoint, predictions, reports)
 ├─ mlruns/                       # MLflow tracking store
-├─ predictions.csv               # FP32 deterministic submission for the 3,000 test images
+├─ predictions.csv               # Phase 1 T4-generated submission for the 3,000 test images
 ├─ check_data.ipynb              # EDA
 ├─ claude.md                     # project blueprint (not part of the submission archive)
 ├─ evaluation_metric.md          # official metric guide (IIIT Bangalore)
@@ -222,11 +247,12 @@ python src/train.py --arch resnet50 --backend torchvision --epochs 8 --batch_siz
     --early_stopping_patience 3 --variant imagenet_pretrained \
     --run_name resnet50_imagenet_pretrained_20261031 --experiment "Deepfake Detection"
 
-# 2) evaluate on the held-out split (FP32 + flip TTA are the defaults)
+# 2) evaluate the submitted Phase 1 soup on the held-out split (FP32 + flip TTA)
 python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta
+#    expected AUC ~0.8962 (Kaggle and local reproduced exactly)
 
-#    optional AMP comparison (faster, fp16)
-python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta --amp
+#    optional AMP comparison on the Phase 0 model
+python src/evaluate.py --weights checkpoints/best_model_phase0.pth --split val --tta --amp
 
 # 3) submission - FP32 + flip TTA + deterministic settings are the defaults
 python inference_script.py --test_dir ./hackathon_dataset/test/images/ \
@@ -330,8 +356,14 @@ submitted FP32 + flip-TTA recipe. Full results: `reports/phase0/robustness/`.
   undisclosed).
 * The soup is **more robust than expected**: JPEG q30, noise, 0.5× downscale and ±20 % lighting
   stay within ~0.004 AUC of clean. The only material drops are **strong blur (σ=2, −0.0195)** and
-  **grayscale (−0.0115)**. Phase 1 should add blur/JPEG/noise augmentation and select on the
-  composite rather than clean AUC alone.
+  **grayscale (−0.0115)**. Phase 1 added blur/JPEG/noise augmentation; see 11.1b.
+
+### 11.1b Phase 1 soup (Kaggle, 17 variants)
+
+Composite **0.8950**, proxy **15.80/20**; clean 0.8962, worst `blur_s2.0` 0.8833, best
+`downscale_0.75` 0.8983. Every variant is within **0.013 AUC** of clean. The local robustness subset
+reproduced the Kaggle values exactly (clean 0.896235, jpeg_q50 0.894174, blur_s2.0 0.883331,
+grayscale 0.890786). Full table: [`docs/phase1_report.md`](docs/phase1_report.md).
 
 ### 11.2 Near-duplicate and shortcut audit (Phase 0)
 
@@ -441,7 +473,7 @@ python -c "import hashlib; a=hashlib.sha256(open('run1.csv','rb').read()).hexdig
 - [ ] `predictions.summary.json` reports `"tta": true`, `"amp": false`, `"deterministic": true`,
       `"num_images": 3000`, `"num_load_failures": 0` and an `output_sha256` equal to the file hash.
 - [ ] `python src/evaluate.py --weights checkpoints/best_model.pth --split val --tta` reproduces the
-      reported ~0.8923 validation AUC (±1e-5 run-to-run) and writes both `predictions.csv` and
+      reported ~0.8962 validation AUC and writes both `predictions.csv` and
       `predictions_detailed.csv`.
 
 ### 12.5 Environment sanity
@@ -453,7 +485,10 @@ python -c "import hashlib; a=hashlib.sha256(open('run1.csv','rb').read()).hexdig
 
 ## 13. Limitations
 
-* Single backbone, single seed: no ensembling (deliberate, to stay inside the speed budget).
+* Phase 1 is a 3-way soup of ResNet-50 EMA runs; still a single architecture family. No
+  diverse-architecture ensemble yet (Phase 2).
+* Clean AUC 0.8962 is below the Phase 1 target (0.91–0.93); ResNet-50 has plateaued. Phase 2
+  stronger backbones (ConvNeXt-T / EfficientNet-B3 / Swin-T) are required.
 * Training data is pre-cropped 224 × 224 faces, so the model expects that framing; full frames would
   need a face detector in front of it.
 * No frequency-domain branch (e.g. FFT/DCT) — a known strong signal for GAN/diffusion artefacts,

@@ -19,6 +19,9 @@ logs/
 # Dataset (provided by the organizers; not part of the code repository)
 hackathon_dataset/
 
+# Kaggle output artifacts (checkpoint, predictions, reports)
+kagggle_out_phase_01/
+
 # Model binaries
 *.pth
 *.pt
