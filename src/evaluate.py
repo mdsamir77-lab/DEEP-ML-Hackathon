@@ -31,16 +31,17 @@ from dataset import (  # noqa: E402
     build_eval_transform,
     build_train_dataframe,
     create_dataloaders,
+    kfold_split,
     train_val_split,
 )
-from model import load_model_from_checkpoint  # noqa: E402
+from ensemble import COMBINE_METHODS, is_ensemble_manifest, load_predictor  # noqa: E402
 from utils import (  # noqa: E402
     compute_metrics,
     configure_deterministic_inference,
     get_device,
+    load_checkpoint,
     plot_confusion_matrix,
     plot_roc_curve,
-    predict_loader,
     save_json,
 )
 
@@ -53,8 +54,16 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
     parser.add_argument("--split", type=str, default="val", choices=["val", "train", "all"])
     parser.add_argument("--val_fraction", type=float, default=0.2)
     parser.add_argument("--split_seed", type=int, default=42)
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=0,
+        help="0 = fixed stratified split; 1..N = that k-fold split (must match training)",
+    )
+    parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--limit", type=int, default=0, help="debug: cap evaluation samples")
     parser.add_argument("--img_size", type=int, default=0, help="0 = use checkpoint config")
     parser.add_argument("--eval_resize", type=int, default=0)
     parser.add_argument("--tta", action="store_true", default=False)
@@ -73,6 +82,13 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--output", type=str, default=None, help="CSV path for predictions")
     parser.add_argument("--plots_dir", type=str, default=None)
+    parser.add_argument(
+        "--combine",
+        type=str,
+        default=None,
+        choices=list(COMBINE_METHODS),
+        help="override the ensemble combination rule (manifests only)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args(argv)
 
@@ -82,18 +98,30 @@ def main(argv: Any = None) -> Dict[str, Any]:
     configure_deterministic_inference(seed=args.seed)
     device = get_device()
 
-    model, checkpoint = load_model_from_checkpoint(args.weights, device=device)
-    config = checkpoint.get("config", {}) or {}
-    img_size = args.img_size or int(config.get("img_size", 224))
-    eval_resize = args.eval_resize or int(config.get("eval_resize", 0)) or None
-
+    predictor = load_predictor(args.weights, device=device, method=args.combine)
+    config = {}
+    if not is_ensemble_manifest(args.weights):
+        checkpoint = load_checkpoint(args.weights, map_location="cpu")
+        config = checkpoint.get("config", {}) or {}
+    elif predictor.metadata:
+        config = {"img_size": predictor.img_size, "eval_resize": predictor.eval_resize or 0}
+    img_size = args.img_size or int(config.get("img_size", 224) or 224)
+    eval_resize = args.eval_resize or int(config.get("eval_resize", 0) or 0) or None
     data_dir = Path(args.data_dir)
     metadata_csv = Path(args.metadata_csv) if args.metadata_csv else data_dir / "train_metadata.csv"
     frame = build_train_dataframe(metadata_csv, data_dir / "train")
-    train_df, val_df = train_val_split(
-        frame, val_fraction=args.val_fraction, split_seed=args.split_seed
-    )
+    if args.fold > 0:
+        train_df, val_df = kfold_split(
+            frame, fold=args.fold, folds=args.folds, seed=args.split_seed
+        )
+    else:
+        train_df, val_df = train_val_split(
+            frame, val_fraction=args.val_fraction, split_seed=args.split_seed
+        )
     selected = {"val": val_df, "train": train_df, "all": frame}[args.split]
+    if args.limit and args.limit > 0:
+        selected = selected.head(int(args.limit)).reset_index(drop=True)
+        print(f"[eval] debug limit: using {len(selected)} samples", flush=True)
 
     _, loader = create_dataloaders(
         None,
@@ -109,8 +137,8 @@ def main(argv: Any = None) -> Dict[str, Any]:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     started = time.time()
-    outputs = predict_loader(
-        model, loader, device, tta=args.tta, amp=args.amp, desc=f"eval {args.split}"
+    outputs = predictor.predict_loader(
+        loader, tta=args.tta, amp=args.amp, desc=f"eval {args.split}"
     )
     elapsed = time.time() - started
     peak_gpu_mb = (
@@ -128,7 +156,34 @@ def main(argv: Any = None) -> Dict[str, Any]:
     metrics["peak_gpu_memory_mb"] = round(peak_gpu_mb, 1) if peak_gpu_mb is not None else None
     metrics["checkpoint"] = str(args.weights)
 
-    run_name = Path(args.weights).parent.name
+    # Ensemble provenance: the combined score must be auditable against the
+    # individual members, otherwise a multi-architecture result is unverifiable.
+    metrics["ensemble"] = predictor.describe()
+    if outputs.get("num_members", 1) > 1:
+        member_metrics = []
+        for arch, weights_, probs in zip(
+            outputs["member_arches"], outputs["member_weights"], outputs["member_probs"]
+        ):
+            member = compute_metrics(outputs["labels"], probs, threshold=args.threshold)
+            member_metrics.append(
+                {
+                    "arch": arch,
+                    "weight": float(weights_),
+                    "auc": float(member["auc"]),
+                    "accuracy": float(member["accuracy"]),
+                    "f1": float(member["f1"]),
+                }
+            )
+        metrics["ensemble"]["member_metrics"] = member_metrics
+        print("[eval] ensemble members:", flush=True)
+        for member in member_metrics:
+            print(
+                f"  {member['arch']:<22} weight={member['weight']:.3f} "
+                f"AUC={member['auc']:.4f} acc={member['accuracy']:.4f}",
+                flush=True,
+            )
+
+    run_name = Path(args.weights).stem if is_ensemble_manifest(args.weights) else Path(args.weights).parent.name
     plots_dir = Path(args.plots_dir) if args.plots_dir else Path("reports") / f"eval_{run_name}_{args.split}"
     plots_dir.mkdir(parents=True, exist_ok=True)
     plot_roc_curve(

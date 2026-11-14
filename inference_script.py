@@ -12,6 +12,15 @@ python inference_script.py \
     --weights ./checkpoints/best_model.pth \
     --output predictions.csv
 
+``--weights`` also accepts a Phase 2 ensemble manifest (``.json``), so the same
+entry point produces the submission for a single model or a multi-architecture
+ensemble:
+
+python inference_script.py \
+    --test_dir ./hackathon_dataset/test/images/ \
+    --weights ./checkpoints/ensemble_phase2.json \
+    --output predictions.csv
+
 Output CSV columns: image_id,label,confidence
   - image_id   : file name without extension
   - label      : 0 (real) / 1 (fake)

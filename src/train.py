@@ -51,6 +51,7 @@ from dataset import (  # noqa: E402
     class_balance,
     create_dataloaders,
     create_dual_view_loader,
+    kfold_split,
     train_val_split,
 )
 from model import build_model, build_optimizer_param_groups, resolve_backend  # noqa: E402
@@ -120,6 +121,18 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     # tracking / output
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=0,
+        help="Phase 2: 0 = the fixed stratified split; 1..N = that k-fold split",
+    )
+    parser.add_argument(
+        "--folds",
+        type=int,
+        default=5,
+        help="Phase 2: number of stratified folds used when --fold > 0",
+    )
     parser.add_argument("--experiment", type=str, default="Deepfake Detection")
     parser.add_argument("--tracking_uri", type=str, default="mlruns")
     parser.add_argument("--variant", type=str, default="baseline")
@@ -324,9 +337,14 @@ def main(argv: Any = None) -> Dict[str, Any]:
 
     # ------------------------------------------------------------------ data
     dataframe = build_train_dataframe(metadata_csv, train_dir)
-    train_df, val_df = train_val_split(
-        dataframe, val_fraction=args.val_fraction, split_seed=args.split_seed
-    )
+    if args.fold > 0:
+        train_df, val_df = kfold_split(
+            dataframe, fold=args.fold, folds=args.folds, seed=args.split_seed
+        )
+    else:
+        train_df, val_df = train_val_split(
+            dataframe, val_fraction=args.val_fraction, split_seed=args.split_seed
+        )
     if args.limit_train:
         train_df = train_df.groupby("label", group_keys=False).head(max(1, args.limit_train // 2))
     if args.limit_val:

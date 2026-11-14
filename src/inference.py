@@ -31,12 +31,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from dataset import build_test_dataframe, create_test_loader  # noqa: E402
-from model import load_model_from_checkpoint  # noqa: E402
+from ensemble import COMBINE_METHODS, is_ensemble_manifest, load_predictor  # noqa: E402
 from utils import (  # noqa: E402
     configure_deterministic_inference,
     environment_info,
     get_device,
-    predict_loader,
+    load_checkpoint,
     save_json,
 )
 
@@ -76,6 +76,13 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
         help="force FP32 inference (default: the submitted recipe)",
     )
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--combine",
+        type=str,
+        default=None,
+        choices=list(COMBINE_METHODS),
+        help="override the ensemble combination rule (manifests only)",
+    )
     parser.add_argument(
         "--sample_submission",
         type=str,
@@ -203,14 +210,21 @@ def run_inference(
     force_cpu: bool = False,
     sample_submission: str | Path | None = None,
     seed: int = 42,
+    combine: str | None = None,
 ) -> pd.DataFrame:
     """Run inference and write the submission CSV (image_id, label, confidence)."""
     configure_deterministic_inference(seed=seed)
     device = get_device(prefer_cuda=not force_cpu)
-    model, checkpoint = load_model_from_checkpoint(weights, device=device)
-    config = checkpoint.get("config", {}) or {}
-    resolved_img_size = int(img_size or config.get("img_size", 224))
-    resolved_resize = int(eval_resize or config.get("eval_resize", 0)) or None
+    predictor = load_predictor(weights, device=device, method=combine)
+    if is_ensemble_manifest(weights):
+        config = {"img_size": predictor.img_size, "eval_resize": predictor.eval_resize or 0}
+        arch = "ensemble:" + "+".join(predictor.arches)
+    else:
+        checkpoint = load_checkpoint(weights, map_location="cpu")
+        config = checkpoint.get("config", {}) or {}
+        arch = checkpoint.get("arch")
+    resolved_img_size = int(img_size or config.get("img_size", 224) or 224)
+    resolved_resize = int(eval_resize or config.get("eval_resize", 0) or 0) or None
 
     test_df = build_test_dataframe(test_dir)
     loader = create_test_loader(
@@ -222,7 +236,7 @@ def run_inference(
     )
 
     started = time.time()
-    outputs = predict_loader(model, loader, device, tta=tta, amp=amp, desc="inference")
+    outputs = predictor.predict_loader(loader, tta=tta, amp=amp, desc="inference")
     elapsed = time.time() - started
     if len(outputs["image_ids"]) != len(test_df):
         raise RuntimeError(
@@ -266,7 +280,8 @@ def run_inference(
         "unique_confidences": int(frame["confidence"].nunique()),
         "sample_submission": str(sample_path) if sample_path is not None else None,
         "sample_submission_order": bool(ordered),
-        "arch": checkpoint.get("arch"),
+        "arch": arch,
+        "ensemble": predictor.describe(),
         "checkpoint_sha256": _sha256(Path(weights)),
         "output_sha256": _sha256(output_path),
         "num_load_failures": int(outputs.get("num_load_failures", 0)),
@@ -296,6 +311,7 @@ def main(argv: Any = None) -> pd.DataFrame:
         force_cpu=args.cpu,
         sample_submission=args.sample_submission,
         seed=args.seed,
+        combine=args.combine,
     )
 
 

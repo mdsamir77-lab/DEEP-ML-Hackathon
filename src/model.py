@@ -236,7 +236,29 @@ def attach_binary_head(
             )
             return in_features
 
-    raise ValueError(f"Could not locate a classifier head on torchvision model '{arch}'")
+    # Some backbones nest the classifier one level deeper (e.g. a wrapper module
+    # whose ``classifier``/``head`` attribute is not a Sequential/Linear). Walk the
+    # last ``Linear`` in the module tree and swap only that layer, leaving the
+    # surrounding flattening/normalisation layers untouched.
+    last_linear_name: Optional[str] = None
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            last_linear_name = name
+    if last_linear_name is None:
+        raise ValueError(f"Could not locate a classifier head on torchvision model '{arch}'")
+
+    parent_name, _, child_name = last_linear_name.rpartition(".")
+    parent = model.get_submodule(parent_name) if parent_name else model
+    last_linear = getattr(parent, child_name)
+    setattr(
+        parent,
+        child_name,
+        torch.nn.Sequential(
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(int(last_linear.in_features), num_classes),
+        ),
+    )
+    return int(last_linear.in_features)
 
 
 def build_torchvision_model(
@@ -280,11 +302,18 @@ def build_torchvision_model(
 
 
 def resolve_backend(arch: str, backend: str = "auto") -> str:
-    """Resolve ``auto`` to ``torchvision`` when its ImageNet weights are cached."""
+    """Resolve ``auto`` to the backend that can actually build ``arch``.
+
+    A few architecture names are torchvision-only: ``swin_t`` (timm calls it
+    ``swin_tiny_patch4_window7_224``) and ``convnext_tiny`` also exist in timm
+    but with different weight tensors.  So the rule is: if torchvision knows the
+    name, use torchvision; only fall back to timm for names torchvision does not
+    expose.  This prevents ``timm.create_model('swin_t')`` from raising
+    ``RuntimeError: Unknown model`` when ``--backend auto`` is used.
+    """
     if backend in ("timm", "torchvision"):
         return backend
-    path = torchvision_weight_path(arch)
-    if path is not None and path.exists() and path.stat().st_size > 0:
+    if torchvision_weights(arch) is not None:
         return "torchvision"
     return "timm"
 

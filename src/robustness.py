@@ -33,6 +33,8 @@ from PIL import Image, ImageEnhance, ImageFilter  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 from torchvision import transforms  # noqa: E402
 
+import torch  # noqa: E402
+
 SRC_DIR = Path(__file__).resolve().parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -41,14 +43,16 @@ from dataset import (  # noqa: E402
     DeepfakeDataset,
     build_eval_transform,
     build_train_dataframe,
+    kfold_split,
     train_val_split,
 )
-from model import load_model_from_checkpoint  # noqa: E402
+from ensemble import is_ensemble_manifest, load_predictor  # noqa: E402
 from utils import (  # noqa: E402
     composite_auc,
     compute_metrics,
     configure_deterministic_inference,
     get_device,
+    load_checkpoint,
     predict_loader,
     save_json,
 )
@@ -186,9 +190,14 @@ def evaluate_variant(
         persistent_workers=num_workers > 0,
         prefetch_factor=2 if num_workers > 0 else None,
     )
-    outputs = predict_loader(
-        model, loader, device, tta=tta, amp=amp, desc=f"robust {name}" if verbose else None
-    )
+    # ``model`` may be a single ``nn.Module`` or an ``Ensemble``; both expose a
+    # compatible ``predict_loader``-style API for this harness.
+    if hasattr(model, "predict_loader") and not isinstance(model, torch.nn.Module):
+        outputs = model.predict_loader(loader, tta=tta, amp=amp, desc=f"robust {name}" if verbose else None)
+    else:
+        outputs = predict_loader(
+            model, loader, device, tta=tta, amp=amp, desc=f"robust {name}" if verbose else None
+        )
     metrics = compute_metrics(outputs["labels"], outputs["probs"], threshold=0.5)
     metrics.update(
         {
@@ -207,6 +216,13 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
     parser.add_argument("--metadata_csv", type=str, default=None)
     parser.add_argument("--val_fraction", type=float, default=0.2)
     parser.add_argument("--split_seed", type=int, default=42)
+    parser.add_argument(
+        "--fold",
+        type=int,
+        default=0,
+        help="0 = fixed stratified split; 1..N = that k-fold split",
+    )
+    parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--img_size", type=int, default=0, help="0 = use checkpoint config")
@@ -234,15 +250,24 @@ def main(argv: Any = None) -> Dict[str, Any]:
     configure_deterministic_inference(seed=args.seed)
     device = get_device(prefer_cuda=not args.cpu)
 
-    model, checkpoint = load_model_from_checkpoint(args.weights, device=device)
-    config = checkpoint.get("config", {}) or {}
-    img_size = int(args.img_size or config.get("img_size", 224))
-    eval_resize = int(args.eval_resize or config.get("eval_resize", 0)) or None
+    predictor = load_predictor(args.weights, device=device)
+    if is_ensemble_manifest(args.weights):
+        config = {"img_size": predictor.img_size, "eval_resize": predictor.eval_resize or 0}
+    else:
+        checkpoint = load_checkpoint(args.weights, map_location="cpu")
+        config = checkpoint.get("config", {}) or {}
+    img_size = int(args.img_size or config.get("img_size", 224) or 224)
+    eval_resize = int(args.eval_resize or config.get("eval_resize", 0) or 0) or None
 
     data_dir = Path(args.data_dir)
     metadata_csv = Path(args.metadata_csv) if args.metadata_csv else data_dir / "train_metadata.csv"
     frame = build_train_dataframe(metadata_csv, data_dir / "train")
-    _, val_df = train_val_split(frame, val_fraction=args.val_fraction, split_seed=args.split_seed)
+    if args.fold > 0:
+        _, val_df = kfold_split(frame, fold=args.fold, folds=args.folds, seed=args.split_seed)
+    else:
+        _, val_df = train_val_split(
+            frame, val_fraction=args.val_fraction, split_seed=args.split_seed
+        )
     if args.limit and args.limit > 0:
         val_df = val_df.head(int(args.limit)).reset_index(drop=True)
         print(f"[robustness] debug limit: using {len(val_df)} validation images", flush=True)
@@ -258,7 +283,7 @@ def main(argv: Any = None) -> Dict[str, Any]:
     for name in variant_names:
         print(f"[robustness] evaluating {name} ...", flush=True)
         metrics[name] = evaluate_variant(
-            model=model,
+            model=predictor,
             dataframe=val_df,
             name=name,
             device=device,
@@ -280,6 +305,7 @@ def main(argv: Any = None) -> Dict[str, Any]:
     composite = composite_auc(clean_auc, degraded)
     summary = {
         "checkpoint": str(args.weights),
+        "ensemble": predictor.describe(),
         "n_samples": int(metrics["clean"]["n_samples"]),
         "tta": bool(args.tta),
         "amp": bool(args.amp),

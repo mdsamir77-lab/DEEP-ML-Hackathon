@@ -11,7 +11,12 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold, train_test_split
+from sklearn.model_selection import (
+    GroupShuffleSplit,
+    StratifiedGroupKFold,
+    StratifiedKFold,
+    train_test_split,
+)
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
@@ -150,6 +155,37 @@ def train_val_split(
         stratify=df["label"].to_numpy(),
     )
     return train_df.reset_index(drop=True), val_df.reset_index(drop=True)
+
+
+def kfold_split(
+    df: pd.DataFrame,
+    fold: int,
+    folds: int = 5,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return the ``fold``-th label-stratified fold as ``(train_df, val_df)``.
+
+    Phase 2 needs more than one *seed* per architecture: k-fold gives every run
+    a genuinely different validation set, so the reported mean ± std reflects
+    data variance rather than only initialisation variance.  ``fold`` is
+    1-based, matching the CLI (``--fold 1`` is the first fold).
+    """
+    if folds < 2:
+        raise ValueError(f"folds must be >= 2, got {folds}")
+    if not 1 <= fold <= folds:
+        raise ValueError(f"fold must be in [1, {folds}], got {fold}")
+
+    splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed)
+    indices = list(splitter.split(df, df["label"].to_numpy()))
+    train_idx, val_idx = indices[fold - 1]
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df = df.iloc[val_idx].reset_index(drop=True)
+    print(
+        f"[dataset] k-fold {fold}/{folds}: train={len(train_df)} val={len(val_df)} "
+        f"(val positive rate {float(val_df['label'].mean()):.3f})",
+        flush=True,
+    )
+    return train_df, val_df
 
 
 # ---------------------------------------------------------------------------
