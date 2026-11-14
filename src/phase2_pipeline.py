@@ -110,16 +110,36 @@ def stage_train(args: argparse.Namespace) -> int:
                     "--data_dir", args.data_dir,
                     "--img_size", str(args.img_size),
                     "--num_workers", str(args.num_workers),
-                    "--val_tta",
                 ]
+                # Phase 1 recipe: TTA at validation, robust augmentation warmed in
+                # after a few clean epochs, EMA weights, composite selection
+                # against a degraded monitor.  These flags mirror the exact
+                # train.py surface (--degradation_p / --selection_metric are the
+                # canonical spellings; --robust_prob / --composite_select do not
+                # exist on train.py).
+                if args.tta:
+                    command.append("--val_tta")
                 if args.robust_aug:
-                    command += ["--robust_aug", "--robust_prob", str(args.robust_prob)]
+                    command += [
+                        "--robust_aug",
+                        "--degradation_p", str(args.robust_prob),
+                        "--robust_start_epoch", str(args.robust_start_epoch),
+                    ]
                 if args.ema:
                     command += ["--ema", "--ema_decay", str(args.ema_decay)]
                 if args.composite_select:
-                    command.append("--composite_select")
+                    command += [
+                        "--selection_metric", "composite",
+                        "--selection_clean_weight", str(args.selection_clean_weight),
+                    ]
+                else:
+                    command += ["--selection_metric", "clean_auc"]
                 if not args.amp:
                     command.append("--no_amp")
+                command += [
+                    "--robust_monitor_samples", str(args.monitor_samples),
+                    "--robust_monitor_variants", args.monitor_variants,
+                ]
                 failures += run(command, args.dry_run) != 0
     return 1 if failures else 0
 
@@ -340,11 +360,34 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
     parser.add_argument("--robust_aug", action="store_true", default=True)
     parser.add_argument("--no_robust_aug", dest="robust_aug", action="store_false")
     parser.add_argument("--robust_prob", type=float, default=0.4)
+    parser.add_argument(
+        "--robust_start_epoch",
+        type=int,
+        default=3,
+        help="epoch at which the strong degradation transform replaces the mild one",
+    )
     parser.add_argument("--ema", action="store_true", default=True)
     parser.add_argument("--no_ema", dest="ema", action="store_false")
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--composite_select", action="store_true", default=True)
     parser.add_argument("--no_composite_select", dest="composite_select", action="store_false")
+    parser.add_argument(
+        "--selection_clean_weight",
+        type=float,
+        default=0.5,
+        help="weight of clean AUC in 0.5-clean/0.5-degraded composite selection",
+    )
+    parser.add_argument(
+        "--monitor_samples",
+        type=int,
+        default=600,
+        help="degraded-monitor size; Phase 1 used 200 and over-fit selection to it",
+    )
+    parser.add_argument(
+        "--monitor_variants",
+        type=str,
+        default="jpeg_q50,blur_s1.0,noise_0.03,brightness_0.8,downscale_0.50",
+    )
     parser.add_argument("--tta", action="store_true", default=True)
     parser.add_argument("--no_tta", dest="tta", action="store_false")
     parser.add_argument("--amp", action="store_true", default=True)
