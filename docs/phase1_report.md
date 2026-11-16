@@ -1,11 +1,12 @@
 # Phase 1 report — ResNet-50 improvements (Kaggle)
 
-**Status: PARTIALLY COMPLETED — the pipeline works, but the target clean AUC (0.91–0.93) was not met.**
+**Historical Phase 1 report — completed.** The Phase 1 clean-AUC target (0.91–0.93) was not met; Phase 2 was subsequently completed. The Phase 1 soup is now a single-model fallback, not the current ensemble. See the repository [`README.md`](../README.md) and [`technical_report.md`](../technical_report.md) for Phase 2 results.
 
 Phase 1 added EMA, robust augmentation, composite selection, a robustness monitor and a model-soup
-utility. The Kaggle soup is a **real but small improvement** over the Phase 0 baseline. The
-ResNet-50 has plateaued around 0.89–0.896; Phase 2 (stronger backbones + ensemble) is required for
-the 0.93+ AUC needed to approach a 96 score.
+utility. Its Kaggle soup was a **real but small improvement** over the Phase 0 baseline. The Phase 1
+ResNet-50 plateau around 0.89–0.896 motivated the later Phase 2 architecture comparison; it is a
+historical observation, not a statement that Phase 2 remains future work. See [`phase2_report.md`](phase2_report.md)
+for the subsequent runs and their validation limitation.
 
 ---
 
@@ -110,15 +111,16 @@ is strong blur (0.8833). Robustness is no longer the main weakness; clean AUC is
    soup on clean AUC.
 2. **The 3-way soup is a real but small gain.** 0.8962, +0.0057 over the best parent and +0.0039
    over the Phase 0 baseline. The soup is the Phase 1 win.
-3. **The 200-image robustness monitor was optimistic.** P1-B's monitor AUC was 0.927, but the full
-   17-variant mean is 0.8938 and the composite 0.8950. The composite selection over-weighted a
-   small, non-representative monitor. Phase 2 should use a larger stratified monitor (400–600
-   images) and/or the full suite for the final decision.
-4. **Robustness is no longer the main weakness.** Every variant is within 0.013 of clean; the worst
-   is strong blur (0.8833). The model is uniformly robust.
-5. **Clean AUC is the bottleneck.** ResNet-50 has plateaued at 0.89–0.896. The Phase 1 target
-   (0.91–0.93) was not met. Phase 2 stronger backbones (ConvNeXt-T, EfficientNet-B3, Swin-T) and
-   an ensemble are required.
+3. **The 200-image Phase 1 robustness monitor was optimistic.** P1-B's monitor AUC was 0.927, but
+   the Phase 1 full 17-variant mean is 0.8938 and the composite is 0.8950. Phase 2 later used a
+   five-variant, 600-image monitor for checkpoint selection; that monitor is not a full final-ensemble
+   robustness evaluation.
+4. **Phase 1 robustness was relatively stable on its tested variants.** Each Phase 1 variant was
+   within 0.013 AUC of that soup's clean score; the worst was strong blur (0.8833). This describes
+   only the measured Phase 1 set, not general robustness or the Phase 2 ensemble.
+5. **The Phase 1 clean-AUC target was not met.** Its ResNet-50 soup scored 0.8962. The planned
+   stronger-backbone comparison and ensemble were subsequently carried out in Phase 2; see
+   [`phase2_report.md`](phase2_report.md) for the actual results and single-holdout caveat.
 6. **Efficiency is excellent.** 3,000 images in 52 s on a T4 (57.7 img/s), FP32 deterministic,
    20/20. The Kaggle-generated predictions are T4-native and canary-friendly.
 7. **Predictions are valid.** 3,000 rows, unique IDs, sample-submission order, confidence in
@@ -137,23 +139,21 @@ is strong blur (0.8833). Robustness is no longer the main weakness; clean AUC is
 | Bonus (5) | 0 | **0** | 0 |
 | **Estimated total** | **83.9–84.9** | **84.4–85.4** | **+0.5–0.6** |
 
-**Why the score is still far from 96:** the AUC is 0.8962, so the accuracy sub-score is 39.62/50.
-Even with perfect robustness (20) and documentation (10) and no bonus, the current ceiling is
-**89.62**. With all bonuses (+5) the ceiling is **94.62**. Reaching 96 needs AUC ≈0.93 with
-robustness 18 and all bonuses, or AUC ≈0.95 with robustness 16 and all bonuses. The current model
-cannot get there; Phase 2/3 are mandatory.
+**Historical Phase 1 score estimate only:** at AUC 0.8962, the Phase 1 soup's estimated accuracy
+component was 39.62/50. The ceiling arithmetic below was calculated for that Phase 1 result; it is
+not an estimate of the later Phase 2 model's score, and no hidden-test score is inferred here.
+Even with perfect robustness (20) and documentation (10) and no bonus, the Phase 1-only ceiling was
+**89.62**; with all bonuses (+5), **94.62**. Phase 2 has since been run; its validation result and
+limitations are documented in [`phase2_report.md`](phase2_report.md).
 
 ---
 
 ## 6. Decision
 
-- **KEEP the Phase 1 soup** as the current best submission. It improves AUC (+0.0039) and
-  robustness (+0.17 proxy) over Phase 0, passes all submission checks, and runs in 52 s on the T4.
-- **REJECT the Phase 1 target** (clean AUC 0.91–0.93) as not met. The pipeline is validated, but
-  ResNet-50 has plateaued.
-- **Do not tune ResNet-50 further.** Move to Phase 2 (stronger backbones + 5-fold/ensemble) after
-  approval. Use a larger robustness monitor and select on the full suite at the end.
-- Keep the Phase 0 baseline checkpoint and predictions as a fallback.
+- **Historical Phase 1 outcome:** the 3-way soup improved AUC by 0.0039 and the robustness proxy by 0.17 over Phase 0; its T4 inference time was 52 s. It is retained as a fallback, not the current ensemble.
+- The Phase 1 target (clean AUC 0.91–0.93) was not met. ResNet-50 plateaued, which motivated the subsequent Phase 2 architecture comparison.
+- The Phase 2 plan below was subsequently carried out; its single-split validation limitation is documented in the root README and technical report.
+- Phase 0 artifacts remain useful as historical baselines.
 
 ---
 
@@ -182,23 +182,13 @@ cannot get there; Phase 2/3 are mandatory.
 
 ---
 
-## 9. Next phase preview (not implemented)
+## 9. Historical Phase 2 proposal (superseded)
 
-**Phase 2 — stronger architectures + reliable validation:**
-
-- ConvNeXt-T, EfficientNet-B3, Swin-T with the Phase 1 recipe (EMA, robust aug, composite).
-- 5-fold CV or 2–3 seeds per architecture; report mean ± std.
-- Soup per architecture, then ensemble across architectures (logit/rank averaging).
-- Larger stratified robustness monitor (400–600 images) and full 17-variant evaluation for final
-  candidates.
-- Target clean AUC 0.93–0.96, degraded 0.90–0.93, composite 0.92–0.94.
-- Then Phase 3 (frequency branch if needed) and Phase 4 (Grad-CAM, TF export, documentation,
-  packaging).
+This was a pre-run proposal, not a description of the final Phase 2 protocol. The implemented shared-recipe backbone comparison, probability ensemble, and five-variant/600-image checkpoint-selection monitor are documented in [`phase2_report.md`](phase2_report.md). The saved Phase 2 outputs contain only fold 0 of one shared validation split: they do **not** provide five-fold results, mean ± standard deviation across folds, or an independent ensemble evaluation. A full 17-variant evaluation of the final Phase 2 ensemble is also not present in the available artifacts. Grad-CAM materials were produced later and are described in the technical report.
 
 ---
 
-## 10. Status
+## 10. Historical Phase 1 status
 
-**PARTIALLY COMPLETED — Phase 1 target not met; Phase 2 required.** The soup is kept as the
-current best submission. Phase 2 has not started and awaits explicit approval.
+**Phase 1 is complete.** Its clean-AUC target was not met. The Phase 1 soup is a fallback; the current submitted model is the Phase 2 weighted probability ensemble. Phase 2 results and validation caveats are in the root [`README.md`](../README.md) and [`technical_report.md`](../technical_report.md).
 

@@ -1,7 +1,10 @@
-# Phase 1 Kaggle handoff
+# Historical Phase 1 Kaggle handoff (superseded)
 
-Phase 0 is verified locally. Phase 1 training will run on Kaggle (single T4, not 2×T4
-automatically). This document lists exactly what to upload, run, and bring back.
+**Historical handoff — do not use these instructions for current training or submission.** The
+Phase 1 Kaggle run described here is complete, and its soup is now only a single-model fallback.
+Phase 2 is also complete. Current weights, inference recipe, validation caveat, and the artifact-based
+Phase 2 report are in the root [`README.md`](../README.md), [`technical_report.md`](../technical_report.md),
+and [`phase2_report.md`](phase2_report.md).
 
 ## 1. What to upload
 
@@ -82,10 +85,11 @@ export MLFLOW_DISABLE_AGENT_HINT=1
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-## 4. Phase 1 training commands (exact)
+## 4. Historical Phase 1 training commands (already run)
 
-All commands use the Phase 1 code delivered in this phase. Use a **single T4** and
-`CUDA_VISIBLE_DEVICES=0`. `--num_workers 4` is a good default on Kaggle.
+The commands below document the completed Phase 1 Kaggle runs; they are retained for provenance
+and are not instructions for the current submission. They used the Phase 1 code, a **single T4**,
+and `CUDA_VISIBLE_DEVICES=0`. `--num_workers 4` was the recorded Kaggle default.
 
 ### P1-A — EMA + mild augmentation (clean-AUC control)
 
@@ -213,19 +217,10 @@ reports/<run_name>/*.png
 logs/train_<run_name>.out.log
 ```
 
-Then tell me the run name and paths. I will:
-
-1. Verify the checkpoint loads with the local `src/model.py`.
-2. Recompute validation AUC/F1/accuracy on the same split.
-3. Compare against the Phase 0 baseline (AUC 0.8923, F1 0.8636).
-4. Check the config matches the intended recipe.
-5. Recommend keep/reject and update the score estimate.
+This was the planned post-run verification workflow when the handoff was written. Phase 1 results and local checks are now recorded in [`phase1_report.md`](phase1_report.md); Phase 2 results are recorded in [`phase2_report.md`](phase2_report.md). Do not treat this section as a pending action.
 
 ## 7. Rules and budget
 
-- **Single GPU only** in Phase 1; do not introduce multi-GPU complexity.
-- **No pseudo-labeling** and **no external training data**; ImageNet weights only.
-- Kaggle sessions can time out: save a checkpoint every epoch and keep the notebook
-  output small.
-- Do not run expensive training locally; local use is limited to smoke tests.
-- Phase 1 GPU budget: ~2–3 hours of the ~30 hours/week; keep the rest for Phase 2.
+- **Historical Phase 1 run constraints:** single GPU; no pseudo-labeling or external training data; ImageNet weights only.
+- Kaggle sessions could time out, so the Phase 1 workflow saved checkpoints and limited notebook output.
+- The local smoke-test guidance and ~2–3 GPU-hour Phase 1 budget were planning notes for the completed Phase 1 work; they are not current run instructions.

@@ -21,6 +21,7 @@ hackathon_dataset/
 
 # Kaggle output artifacts (checkpoint, predictions, reports)
 kagggle_out_phase_01/
+kaggle_output_phase2/
 
 # Model binaries
 *.pth

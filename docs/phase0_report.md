@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-07  
 **Environment:** local Windows, RTX 3050 Laptop 6 GB, PyTorch 2.5.1+cu121, Python 3.10  
-**Status:** COMPLETED locally; Kaggle was **not** used in Phase 0.
+**Status:** COMPLETED locally; Kaggle was **not** used in Phase 0. This is a historical Phase 0 snapshot; its “next phase” section records the plan at that time. Phase 1 and Phase 2 have since completed (see the root README and technical report).
 
 ---
 
@@ -141,10 +141,7 @@ The full robustness and audit runs are recorded under `reports/phase0/`.
 | EXIF present | 0 % real / 0 % fake | **no metadata shortcut** |
 | Largest class-wise pixel effect | std_r, effect size 0.177 | small; no dominant colour/border shortcut |
 
-The 6.07 % train/val near-duplicate leakage means the local 0.8923 AUC is **mildly optimistic**.
-The 7.93 % test-train match means the hidden test has a similar fraction of near-duplicates, so the
-relative ranking should still transfer. Phase 1 will report a pHash-grouped validation number
-alongside the random-split number.
+The 6.07 % train/validation near-duplicate leakage may make the random-split AUC optimistic. No pHash-grouped validation number was subsequently documented for Phase 1 or Phase 2, so the size of the effect and transfer of relative model rankings remain unknown. The 7.93 % test-train match is descriptive only; test labels are sealed.
 
 ---
 
@@ -168,50 +165,34 @@ With efficiency 20, robustness 15.63, documentation ~9, and no bonus, the total 
 (→ 84.86), but the model itself is unchanged. The hard ceiling with the current AUC remains
 **89.2** even with perfect robustness/documentation and no bonus.
 
-**Remaining time:** Phase 0 completed on 2026-11-07; assuming Day 1 was Phase 0, **~7 days remain**
-in the 8-day window. Phase 1 (Kaggle ResNet-50 improvements) is the next priority.
+**Historical schedule note (2026-11-07):** the original Phase 0 plan estimated about seven days remaining in an eight-day window and listed Phase 1 as the next priority. That schedule is past; Phases 1 and 2 have since completed.
 
 
 ---
 
-## G. Remaining issues
+## G. Open questions recorded at the end of Phase 0 (historical)
 
-1. **AUC gap.** The model is still 0.8923; Phase 1 must raise clean AUC to ~0.91–0.93 and keep the
-   degraded AUC at ~0.88–0.90.
-2. **Strong blur / grayscale.** `blur_s2.0` (−0.0195) and `grayscale` (−0.0115) are the only
-   material robustness drops. Phase 1 should add blur/JPEG/noise augmentation and a clean/degraded
-   consistency loss.
-3. **Near-duplicate leakage.** 6.07 % of validation images have a train near-duplicate; the local
-   AUC is mildly optimistic. Phase 1 should report a pHash-grouped validation number.
-4. **Cross-class near-duplicates.** 55 pairs suggest possible label noise or genuinely hard pairs;
-   inspect a sample during Phase 1 error analysis, but do not modify the provided labels.
-5. **Hidden test / robustness weights.** Unknown; the local composite is a proxy, not the official
-   score.
-6. **Documentation.** Phase 0 adds robustness/audit sections, but the full architecture diagram,
-   hyperparameter ablation, Grad-CAM, ensemble, and TF export are Phase 4 deliverables.
-7. **Submission size limit.** Still unspecified; keep the final archive organized and avoid
-   unnecessary artifacts.
+The items below are the Phase 0 assessment as of 2026-11-07, not the current project backlog. Phases 1 and 2 have since completed; their measured outcomes are in [`phase1_report.md`](phase1_report.md), [`phase2_report.md`](phase2_report.md), and the root technical report.
+
+1. **AUC gap at Phase 0.** The baseline measured 0.8923; raising clean AUC was a Phase 1 goal, not a current requirement.
+2. **Blur / grayscale.** The listed drops describe the Phase 0 baseline and motivated the later robust-augmentation work. They do not describe Phase 2 ensemble robustness.
+3. **Near-duplicate leakage.** The 6.07% estimate is from the Phase 0 audit. No pHash-grouped Phase 2 estimate is present in the saved Phase 2 artifacts.
+4. **Cross-class near-duplicates.** The audit flagged 55 pairs for inspection; labels were not changed. This is historical audit evidence, not a Phase 1 action item.
+5. **Hidden test / robustness weights.** The local composite was a proxy, not the official score; the official hidden-test result is not inferred from it.
+6. **Documentation / interpretability.** The architecture, ensemble, and Grad-CAM materials were subsequently produced. TensorFlow export is not documented as a completed deliverable here.
+7. **Submission size limit.** The Phase 0 report noted uncertainty at the time. The Phase 2 best-checkpoint payload is now measured in [`phase2_report.md`](phase2_report.md); that figure is not the size of a complete archive.
 
 ---
 
-## H. Kaggle handoff
+## H. Historical Kaggle handoff
 
-See `docs/kaggle_phase1_handoff.md`. It lists:
-
-- the exact code and dataset files to upload;
-- the expected `/kaggle/input/.../hackathon_dataset` layout;
-- notebook setup (single T4, internet on, `PYTHONPATH`, MLflow flags);
-- the Phase 1 training command preview;
-- the outputs to download (`best.pth`, `config.yaml`, `val_predictions.csv`, plots, logs);
-- how to bring them back into the local project for verification.
-
-Phase 1 training is **not** to be run locally; local use is limited to smoke tests.
+[`kaggle_phase1_handoff.md`](kaggle_phase1_handoff.md) preserves the Phase 1 upload layout, T4 setup, training command examples, and artifact-download workflow. It is a historical handoff, not current training guidance: Phase 1 and Phase 2 have completed. Current Phase 2 artifacts are under `kaggle_output_phase2/`; see [`phase2_report.md`](phase2_report.md).
 
 ---
 
-## I. Manual verification checklist
+## I. Phase 0 verification checklist (historical snapshot)
 
-Run these before approving Phase 1:
+These checks and expected values document the Phase 0 verification state. They are not an approval checklist for the completed Phase 1/2 submission:
 
 ```powershell
 # 1. Submission contract and hash
@@ -237,9 +218,9 @@ val leakage; compileall/ruff clean.
 
 ---
 
-## J. Next phase preview (not implemented)
+## J. Historical Phase 1 plan (superseded)
 
-**Phase 1 — Improve the existing ResNet-50 (Kaggle, single T4):**
+This was the proposed Phase 1 work at the time of the Phase 0 report. Phase 1 and Phase 2 have since been completed; do not use this section as the current run plan.
 
 - Add EMA of weights + `update_bn`.
 - Add snapshot/soup across 3–5 seeds and 2 recipes.
@@ -250,18 +231,17 @@ val leakage; compileall/ruff clean.
 - Select checkpoints on the **composite** clean/degraded AUC, not clean AUC alone.
 - Report both random-split and pHash-grouped validation AUC.
 
-Expected Phase 1 result: clean AUC **0.91–0.93**, degraded AUC **0.88–0.90**, composite
-**0.89–0.91**, robustness proxy **15.6–16.5/20**. This is an estimate, not a measured result until
-the Kaggle runs return.
+Historical Phase 1 projection (written before those runs): clean AUC **0.91–0.93**, degraded AUC
+**0.88–0.90**, composite **0.89–0.91**, robustness proxy **15.6–16.5/20**. This was a forecast,
+not the measured Phase 1 outcome; the actual results are recorded in [`phase1_report.md`](phase1_report.md).
 
-**Not in Phase 1:** new architectures, Grad-CAM, TF export, pseudo-labeling (forbidden).
+**Not planned for Phase 1:** new architectures, Grad-CAM, TF export, or pseudo-labeling (forbidden).
+Grad-CAM was later generated; see the technical report. The forecast and scope above are historical,
+not current phase status.
 
 ---
 
 ## K. Phase status
 
-**COMPLETED** — Phase 0 code, local verification, robustness baseline, audit, and Kaggle handoff
-are complete. The model is unchanged; the submission is FP32 deterministic and byte-reproducible.
-
-Phase 1 is **awaiting explicit user approval** (`NEXT PHASE`). No Phase 1 work has started.
+**Historical Phase 0 snapshot (completed).** Its local checks and Kaggle handoff describe the state at that phase. Phase 1 and Phase 2 have since completed; the current submission is the Phase 2 ensemble. Deterministic inference settings improve repeatability on a fixed stack but do not guarantee byte-identical output across GPU architectures. See the root [`README.md`](../README.md) and [`technical_report.md`](../technical_report.md) for current results.
 

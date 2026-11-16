@@ -1,0 +1,24 @@
+# Deepfake detection - validated on Python 3.11, CUDA 12.1, RTX 3050 Laptop (6 GB)
+#
+# CUDA 12.1 wheels (install first, matching the local driver):
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision==0.20.1
+
+# Backbones (timm backend is optional when using --backend torchvision)
+timm==1.0.30
+safetensors==0.7.0
+
+# Data / metrics / plotting
+numpy==2.2.6
+pandas==2.3.3
+pillow==12.1.1
+scikit-learn==1.7.2
+scipy==1.15.3
+matplotlib==3.10.8
+tqdm==4.67.3
+
+# Config, downloads, experiment tracking
+PyYAML==6.0.3
+requests==2.34.2
+mlflow==3.17.2

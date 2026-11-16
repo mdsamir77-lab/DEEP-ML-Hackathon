@@ -1,0 +1,88 @@
+{
+  "num_images": 3000,
+  "elapsed_seconds": 146.61,
+  "images_per_second": 20.46,
+  "device": "cuda",
+  "tta": true,
+  "amp": false,
+  "precision": "fp32",
+  "deterministic": true,
+  "seed": 42,
+  "threshold": 0.5,
+  "predicted_fake_fraction": 0.4756666666666667,
+  "mean_confidence": 0.47543483920097357,
+  "unique_confidences": 2824,
+  "sample_submission": "hackathon_dataset/sample_submission.csv",
+  "sample_submission_order": true,
+  "arch": "ensemble:resnet50+convnext_tiny+efficientnet_b3+swin_t",
+  "ensemble": {
+    "num_members": 4,
+    "arches": [
+      "resnet50",
+      "convnext_tiny",
+      "efficientnet_b3",
+      "swin_t"
+    ],
+    "weights": [
+      0.4,
+      0.35,
+      0.25,
+      0.0
+    ],
+    "combine_method": "mean_prob",
+    "img_size": 224,
+    "eval_resize": null,
+    "members": [
+      {
+        "arch": "resnet50",
+        "backend": "torchvision",
+        "checkpoint": "checkpoints/runs/p2_resnet50_s42/best.pth",
+        "epoch": 5,
+        "val_auc": 0.8969660233803552,
+        "weight": 0.4
+      },
+      {
+        "arch": "convnext_tiny",
+        "backend": "torchvision",
+        "checkpoint": "checkpoints/runs/p2_convnext_tiny_s42/best.pth",
+        "epoch": 4,
+        "val_auc": 0.8969619416144201,
+        "weight": 0.35
+      },
+      {
+        "arch": "efficientnet_b3",
+        "backend": "torchvision",
+        "checkpoint": "checkpoints/runs/p2_efficientnet_b3_s42/best.pth",
+        "epoch": 4,
+        "val_auc": 0.8905025470219434,
+        "weight": 0.25
+      },
+      {
+        "arch": "swin_t",
+        "backend": "torchvision",
+        "checkpoint": "checkpoints/runs/p2_swin_t_s42/best.pth",
+        "epoch": 9,
+        "val_auc": 0.8936189753134797,
+        "weight": 0.0
+      }
+    ]
+  },
+  "checkpoint_sha256": "4a9d47249316628a84de198a8b28ebbca4748ee1d3ec75eff42fe19a954a578c",
+  "output_sha256": "e7f3fc5564bfa0bbde7d590b85b8013000da0fd2d9f0bb8d0463901446e21ad3",
+  "num_load_failures": 0,
+  "load_failures": [],
+  "validation": {
+    "rows": 3000,
+    "unique_ids": 3000,
+    "confidence_min": 0.0197392463684082,
+    "confidence_max": 0.9753173828125,
+    "predicted_fake_fraction": 0.4756666666666667
+  },
+  "environment": {
+    "python": "3.10.20",
+    "torch": "2.5.1+cu121",
+    "cuda_available": true,
+    "cuda_version": "12.1",
+    "gpu_name": "Tesla T4 / RTX 3050"
+  }
+}
